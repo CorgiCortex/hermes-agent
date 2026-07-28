@@ -3893,6 +3893,17 @@ class AIAgent:
         except Exception:
             pass
 
+    def _close_codex_session(self) -> None:
+        """Detach and close the Codex app-server session, if one is active."""
+        codex_session = getattr(self, "_codex_session", None)
+        self._codex_session = None
+        if codex_session is None:
+            return
+        try:
+            codex_session.close()
+        except Exception:
+            logger.debug("Failed to close Codex app-server session", exc_info=True)
+
     def release_clients(self) -> None:
         """Release LLM client resources WITHOUT tearing down session tool state.
 
@@ -3931,6 +3942,11 @@ class AIAgent:
                         pass
         except Exception:
             pass
+
+        # A rebuilt agent cannot reuse this instance's Codex thread. Closing
+        # it here prevents cache eviction from orphaning the app-server and
+        # its MCP subprocesses.
+        self._close_codex_session()
 
         # Retire the OpenAI/httpx client to release sockets immediately.
         # #70773: eviction runs on the gateway's memory-manager thread — a
@@ -4013,6 +4029,9 @@ class AIAgent:
         except Exception:
             pass
 
+        # 5. Close the Codex app-server runtime owned by this agent.
+        self._close_codex_session()
+
         # 6. Close the OpenAI/httpx client
         try:
             client = getattr(self, "client", None)
@@ -4026,21 +4045,6 @@ class AIAgent:
         # sequential LLM calls; see _create_request_openai_client).
         try:
             self._close_cached_request_openai_client(reason="agent_close")
-        except Exception:
-            pass
-
-        # 6c. Close the Codex app-server session. The runtime already drops
-        # it on turn crash / retirement (agent/codex_runtime.py), but hard
-        # teardown had no owner — a /new, /reset, or session expiry left the
-        # app-server child process running until interpreter exit. Clear the
-        # attribute BEFORE close() so a concurrent reader can't grab a
-        # half-closed session, and so a raising close() can't strand a stale
-        # reference behind.
-        try:
-            codex_session = getattr(self, "_codex_session", None)
-            if codex_session is not None:
-                self._codex_session = None
-                codex_session.close()
         except Exception:
             pass
 
