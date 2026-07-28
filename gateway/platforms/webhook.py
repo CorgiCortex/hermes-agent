@@ -960,12 +960,15 @@ class WebhookAdapter(BasePlatformAdapter):
     async def _end_webhook_session(
         self, event: "MessageEvent", session_chat_id: str
     ) -> None:
-        """Mark the per-delivery webhook session ended in state.db.
+        """End the per-delivery session and evict its cached agent.
 
         Resolves the persisted ``session_id`` from the gateway session store
         using the SAME source the run was keyed on (so profile multiplexing
         and key construction match exactly), then closes it via the existing
-        ``SessionDB.end_session`` API — never a hand-written UPDATE.
+        ``SessionDB.end_session`` API — never a hand-written UPDATE.  Webhook
+        delivery IDs make these sessions one-shot, so retaining their agents
+        cannot provide a cache hit and keeps provider runtimes alive until the
+        general cache cap or idle sweep runs.
         """
         runner = self.gateway_runner
         if runner is None:
@@ -974,6 +977,7 @@ class WebhookAdapter(BasePlatformAdapter):
         store = getattr(runner, "session_store", None)
         if session_db is None or store is None:
             return
+        session_key = None
         try:
             key_fn = getattr(runner, "_session_key_for_source", None)
             if key_fn is None:
@@ -1020,6 +1024,18 @@ class WebhookAdapter(BasePlatformAdapter):
                 session_chat_id,
                 e,
             )
+        finally:
+            if session_key:
+                evict = getattr(runner, "_evict_cached_agent", None)
+                if callable(evict):
+                    try:
+                        evict(session_key)
+                    except Exception as e:
+                        logger.debug(
+                            "[webhook] Failed to evict cached agent for %s: %s",
+                            session_chat_id,
+                            e,
+                        )
 
     # ------------------------------------------------------------------
     # Signature validation
