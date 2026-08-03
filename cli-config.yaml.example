@@ -810,6 +810,15 @@ agent:
   # Set to 0 to disable the warning.
   # gateway_timeout_warning: 900
 
+  # Codex app-server host-side turn deadline (seconds). This is not a Codex
+  # protocol limit. Set to 0 to let a healthy turn run indefinitely while
+  # retaining explicit interrupts and subprocess-death detection.
+  # codex_app_server_turn_timeout: 600
+
+  # Interrupt a Codex app-server turn when no activity follows a completed
+  # tool item for this many seconds. Set to 0 to disable the quiet watchdog.
+  # codex_app_server_post_tool_quiet_timeout: 90
+
   # Graceful drain timeout for gateway stop/restart (seconds).
   # Default 0 = no drain: a restart interrupts in-flight agents immediately,
   # cleans up, and exits. Set a positive value only if you want a grace

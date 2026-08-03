@@ -53,6 +53,9 @@ class FakeClient:
         if method == "thread/start":
             return {"thread": {"id": "thread-fake-001"},
                     "activePermissionProfile": {"id": "workspace-write"}}
+        if method == "thread/resume":
+            return {"thread": {"id": (params or {})["threadId"]},
+                    "activePermissionProfile": {"id": "workspace-write"}}
         if method == "turn/start":
             return {"turn": {"id": "turn-fake-001"}}
         if method == "turn/interrupt":
@@ -174,6 +177,31 @@ class TestLifecycle:
         assert params["cwd"] == "/tmp"
         assert "permissions" not in params  # see session.ensure_started() comment
 
+    def test_resume_uses_persisted_thread_id_and_cwd(self):
+        client = FakeClient()
+        s = make_session(client, resume_thread_id="thread-persisted-001")
+
+        assert s.ensure_started() == "thread-persisted-001"
+        assert ("thread/resume", {
+            "threadId": "thread-persisted-001",
+            "cwd": "/tmp",
+        }) in client.requests
+        assert not any(method == "thread/start" for method, _ in client.requests)
+
+    def test_resume_rejects_a_different_returned_thread_id(self):
+        client = FakeClient()
+
+        def mismatched_resume(method, params):
+            if method == "thread/resume":
+                return {"thread": {"id": "thread-unexpected"}}
+            return {}
+
+        client._request_handler = mismatched_resume
+        s = make_session(client, resume_thread_id="thread-persisted-001")
+
+        with pytest.raises(session_mod.CodexAppServerError, match="different thread id"):
+            s.ensure_started()
+
     def test_close_idempotent(self):
         client = FakeClient()
         s = make_session(client)
@@ -186,6 +214,29 @@ class TestLifecycle:
 # ---- turn loop ----
 
 class TestRunTurn:
+    def test_unbounded_timeout_survives_virtual_ten_minutes(self):
+        client = FakeClient()
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        s = make_session(client)
+        first_tick = True
+
+        def virtual_now():
+            nonlocal first_tick
+            if first_tick:
+                first_tick = False
+                return 0.0
+            return 601.0
+
+        with patch.object(session_mod.time, "monotonic", side_effect=virtual_now):
+            result = s.run_turn("long task", turn_timeout=float("inf"))
+
+        assert result.interrupted is False
+        assert result.error is None
+
     def test_simple_text_turn_returns_final_message(self):
         client = FakeClient()
         client.queue_notification("turn/started", threadId="t", turn={"id": "tu1"})
@@ -895,4 +946,3 @@ class TestClassifyOAuthFailure:
         assert _classify_oauth_failure() is None
         assert _classify_oauth_failure("") is None
         assert _classify_oauth_failure("", None) is None  # type: ignore[arg-type]
-

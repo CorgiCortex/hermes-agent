@@ -30,6 +30,15 @@ DEFAULT_CONFIG = {
     "max_live_sessions": 16,
     "agent": {
         "max_turns": 500,
+        # Codex app-server wall-clock turn deadline (seconds). This is a
+        # Hermes host-side safety valve, not a Codex protocol limit. Set to 0
+        # to allow a healthy turn to run indefinitely; explicit user
+        # interrupts and subprocess-death detection remain active.
+        "codex_app_server_turn_timeout": 600,
+        # After a completed Codex tool item, interrupt the turn if app-server
+        # emits no further activity for this many seconds. Set to 0 to disable
+        # the quiet watchdog for long-running tool workflows.
+        "codex_app_server_post_tool_quiet_timeout": 90,
         # Inactivity timeout for gateway agent execution (seconds).
         # The agent can run indefinitely as long as it's actively calling
         # tools or receiving API responses.  Only fires when the agent has

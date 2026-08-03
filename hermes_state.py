@@ -4544,6 +4544,43 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             row = cursor.fetchone()
         return dict(row) if row else None
 
+    def get_codex_thread_id(self, session_id: str) -> Optional[str]:
+        """Return the persisted Codex app-server thread for a Hermes session."""
+        if not session_id:
+            return None
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                "SELECT codex_thread_id FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        value = (
+            row[0]
+            if not isinstance(row, sqlite3.Row)
+            else row["codex_thread_id"]
+        )
+        return str(value).strip() if value else None
+
+    def set_codex_thread_id(self, session_id: str, thread_id: str) -> None:
+        """Durably bind a Hermes session to its Codex app-server thread."""
+        normalized_session_id = str(session_id or "").strip()
+        normalized_thread_id = str(thread_id or "").strip()
+        if not normalized_session_id or not normalized_thread_id:
+            raise ValueError("session_id and thread_id are required")
+
+        def _do(conn):
+            cursor = conn.execute(
+                "UPDATE sessions SET codex_thread_id = ? WHERE id = ?",
+                (normalized_thread_id, normalized_session_id),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(
+                    f"Hermes session not found: {normalized_session_id}"
+                )
+
+        self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
+
     def resolve_session_id(self, session_id_or_prefix: str) -> Optional[str]:
         """Resolve an exact or uniquely prefixed session ID to the full ID.
 

@@ -12,10 +12,12 @@ class FakeCodexSession:
     def __init__(self, result):
         self.result = result
         self.calls = 0
+        self.compact_kwargs = None
         self.closed = False
 
-    def compact_thread(self):
+    def compact_thread(self, **kwargs):
         self.calls += 1
+        self.compact_kwargs = kwargs
         return self.result
 
     def close(self):
@@ -27,8 +29,9 @@ class SlowCodexSession(FakeCodexSession):
         super().__init__(result)
         self.touch_calls = touch_calls
 
-    def compact_thread(self):
+    def compact_thread(self, **kwargs):
         self.calls += 1
+        self.compact_kwargs = kwargs
         _wait_for_touch(self.touch_calls, "context compression in progress")
         return self.result
 
@@ -136,6 +139,27 @@ def test_codex_app_server_compaction_heartbeat_refreshes_activity_while_waiting(
     assert "context compression started" in agent.touch_calls
     assert "context compression in progress" in agent.touch_calls
     assert agent.touch_calls[-1] == "context compression completed"
+
+
+def test_codex_app_server_compaction_honors_unbounded_turn_timeout(monkeypatch):
+    agent = DummyAgent(
+        TurnResult(thread_id="thread-1", turn_id="compact-turn-1")
+    )
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {"agent": {"codex_app_server_turn_timeout": 0}},
+    )
+
+    compress_context(
+        agent,
+        [{"role": "user", "content": "hi"}],
+        "system",
+        approx_tokens=100000,
+        task_id="test",
+        force=True,
+    )
+
+    assert agent._codex_session.compact_kwargs == {"turn_timeout": float("inf")}
 
 
 

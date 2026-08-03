@@ -96,6 +96,19 @@ class TestSessionLifecycle:
         assert session["model"] == "test-model"
         assert session["ended_at"] is None
 
+    def test_codex_thread_id_round_trips(self, db):
+        db.create_session(session_id="codex-session", source="telegram")
+
+        assert db.get_codex_thread_id("codex-session") is None
+        db.set_codex_thread_id("codex-session", "thread-codex-001")
+
+        assert db.get_codex_thread_id("codex-session") == "thread-codex-001"
+        assert db.get_session("codex-session")["codex_thread_id"] == "thread-codex-001"
+
+    def test_codex_thread_id_requires_existing_session(self, db):
+        with pytest.raises(KeyError, match="Hermes session not found"):
+            db.set_codex_thread_id("missing", "thread-codex-001")
+
 
 
 

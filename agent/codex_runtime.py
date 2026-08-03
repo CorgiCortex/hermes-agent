@@ -27,6 +27,48 @@ from agent.stream_single_writer import claim_stream_writer, stream_writer_is_cur
 logger = logging.getLogger(__name__)
 
 
+def resolve_codex_app_server_timeouts() -> tuple[float, float]:
+    """Resolve host-side Codex deadlines from ``config.yaml``.
+
+    ``0`` (and negative values, which are normalized the same way as the
+    gateway timeout family) maps to positive infinity.  The transport keeps
+    polling for explicit interrupts and subprocess death, so disabling these
+    two policy deadlines does not turn a dead child into a silent hang.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        cfg = load_config_readonly() or {}
+    except Exception:
+        logger.debug(
+            "codex app-server timeout config load failed; using defaults",
+            exc_info=True,
+        )
+        cfg = {}
+    agent_cfg = cfg.get("agent") if isinstance(cfg, dict) else None
+    if not isinstance(agent_cfg, dict):
+        agent_cfg = {}
+
+    def _resolve(key: str, default: float) -> float:
+        raw = agent_cfg.get(key, default)
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid agent.%s=%r; using %.0fs",
+                key,
+                raw,
+                default,
+            )
+            value = default
+        return float("inf") if value <= 0 else value
+
+    return (
+        _resolve("codex_app_server_turn_timeout", 600.0),
+        _resolve("codex_app_server_post_tool_quiet_timeout", 90.0),
+    )
+
+
 def _coerce_usage_int(value: Any) -> int:
     if isinstance(value, bool):
         return 0
@@ -639,6 +681,7 @@ def run_codex_app_server_turn(
     # Lazy session: one CodexAppServerSession per AIAgent instance.
     # Spawned on first turn, reused across turns, closed at AIAgent
     # shutdown (see _cleanup hook).
+    codex_session_created = False
     if not hasattr(agent, "_codex_session") or agent._codex_session is None:
         from agent.runtime_cwd import resolve_agent_cwd
 
@@ -680,8 +723,21 @@ def run_codex_app_server_turn(
         # users see no live tool-progress or interim commentary while
         # codex_app_server is running — only the final answer (#33200).
         # Supersedes the narrower item/started-only bridge from #38835.
+        persisted_thread_id = None
+        session_db = getattr(agent, "_session_db", None)
+        session_id = getattr(agent, "session_id", None)
+        if session_db is not None and session_id:
+            if not getattr(agent, "_session_db_created", False):
+                agent._ensure_db_session()
+            getter = getattr(session_db, "get_codex_thread_id", None)
+            if callable(getter):
+                candidate = getter(session_id)
+                if isinstance(candidate, str) and candidate.strip():
+                    persisted_thread_id = candidate.strip()
+
         agent._codex_session = CodexAppServerSession(
             cwd=cwd,
+            resume_thread_id=persisted_thread_id,
             approval_callback=approval_callback,
             request_routing=_ServerRequestRouting(
                 auto_approve_exec=auto_approve_requests,
@@ -689,13 +745,33 @@ def run_codex_app_server_turn(
             ),
             on_event=make_codex_app_server_event_bridge(agent),
         )
+        codex_session_created = True
 
     # NOTE: the user message is ALREADY appended to messages by the
     # standard run_conversation() flow (line ~11823) before the early
     # return reaches us. Do NOT append again — that would duplicate.
 
     try:
-        turn = agent._codex_session.run_turn(user_input=user_message)
+        if codex_session_created:
+            thread_id = agent._codex_session.ensure_started()
+            session_db = getattr(agent, "_session_db", None)
+            session_id = getattr(agent, "session_id", None)
+            if session_db is not None and session_id:
+                if not getattr(agent, "_session_db_created", False):
+                    agent._ensure_db_session()
+                setter = getattr(session_db, "set_codex_thread_id", None)
+                if not callable(setter):
+                    raise RuntimeError(
+                        "session DB cannot persist the Codex thread id"
+                    )
+                setter(session_id, thread_id)
+
+        turn_timeout, quiet_timeout = resolve_codex_app_server_timeouts()
+        turn = agent._codex_session.run_turn(
+            user_input=user_message,
+            turn_timeout=turn_timeout,
+            post_tool_quiet_timeout=quiet_timeout,
+        )
     except Exception as exc:
         logger.exception("codex app-server turn failed")
         # Crash → unconditionally drop the session so the next turn

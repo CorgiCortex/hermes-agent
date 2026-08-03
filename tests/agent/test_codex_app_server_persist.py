@@ -24,11 +24,15 @@ duplicate the user turn (#860 / #42039). This test locks in:
 """
 
 import tempfile
+import math
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
-from agent.codex_runtime import run_codex_app_server_turn
+from agent.codex_runtime import (
+    resolve_codex_app_server_timeouts,
+    run_codex_app_server_turn,
+)
 from hermes_state import SessionDB
 from run_agent import AIAgent
 
@@ -104,12 +108,111 @@ def test_codex_user_interrupt_is_reported_and_cleared():
     assert agent._interrupt_requested is False
 
 
+@patch(
+    "hermes_cli.config.load_config_readonly",
+    return_value={
+        "agent": {
+            "codex_app_server_turn_timeout": 0,
+            "codex_app_server_post_tool_quiet_timeout": 0,
+        }
+    },
+)
+def test_zero_codex_timeouts_are_unbounded(_load_config):
+    turn_timeout, quiet_timeout = resolve_codex_app_server_timeouts()
+
+    assert math.isinf(turn_timeout)
+    assert math.isinf(quiet_timeout)
+
+
+@patch(
+    "hermes_cli.config.load_config_readonly",
+    return_value={
+        "agent": {
+            "codex_app_server_turn_timeout": 0,
+            "codex_app_server_post_tool_quiet_timeout": 12,
+        }
+    },
+)
+def test_codex_runtime_passes_configured_timeouts(_load_config):
+    agent = _make_agent(session_db=None)
+
+    run_codex_app_server_turn(
+        agent,
+        user_message="hello",
+        original_user_message="hello",
+        messages=[{"role": "user", "content": "hello"}],
+        effective_task_id="task-1",
+    )
+
+    agent._codex_session.run_turn.assert_called_once_with(
+        user_input="hello",
+        turn_timeout=float("inf"),
+        post_tool_quiet_timeout=12.0,
+    )
+
+
+def test_codex_thread_id_is_persisted_then_resumed(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    sid = "sess-codex-resume"
+    db.create_session(session_id=sid, source="telegram", model="codex")
+    constructed_with: list[str | None] = []
+
+    class FakeResumableSession:
+        def __init__(self, *, resume_thread_id=None, **_kwargs):
+            constructed_with.append(resume_thread_id)
+            self.thread_id = resume_thread_id or "thread-created-001"
+
+        def ensure_started(self):
+            return self.thread_id
+
+        def run_turn(self, **_kwargs):
+            turn = _make_turn()
+            turn.thread_id = self.thread_id
+            return turn
+
+        def close(self):
+            return None
+
+    def make_fresh_agent():
+        agent = _make_agent(session_db=db, session_id=sid)
+        agent._codex_session = None
+        agent.session_cwd = str(tmp_path)
+        return agent
+
+    with patch(
+        "agent.transports.codex_app_server_session.CodexAppServerSession",
+        FakeResumableSession,
+    ):
+        first = make_fresh_agent()
+        first_result = run_codex_app_server_turn(
+            first,
+            user_message="first",
+            original_user_message="first",
+            messages=[{"role": "user", "content": "first"}],
+            effective_task_id="task-1",
+        )
+        second = make_fresh_agent()
+        second_result = run_codex_app_server_turn(
+            second,
+            user_message="second",
+            original_user_message="second",
+            messages=[{"role": "user", "content": "second"}],
+            effective_task_id="task-2",
+        )
+
+    assert first_result["completed"] is True
+    assert second_result["completed"] is True
+    assert constructed_with == [None, "thread-created-001"]
+    assert db.get_codex_thread_id(sid) == "thread-created-001"
+
+
 def test_codex_turn_persists_each_message_exactly_once():
     """The user turn (flushed at turn start) must not be duplicated; the
     projected assistant message must land once.  Uses a real SessionDB and the
     real AIAgent._flush_messages_to_session_db to prove no #860/#42039
     duplicate-write regression on the codex path."""
     tmp = tempfile.mkdtemp(prefix="codex_persist_")
+    db = None
     try:
         db = SessionDB(Path(tmp) / "state.db")
         sid = "sess-codex-once"
@@ -158,6 +261,8 @@ def test_codex_turn_persists_each_message_exactly_once():
     finally:
         import shutil
 
+        if db is not None:
+            db.close()
         shutil.rmtree(tmp)
 
 
