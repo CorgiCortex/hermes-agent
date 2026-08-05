@@ -603,6 +603,13 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         if not isinstance(note, dict):
             return
         method = note.get("method") or ""
+        if method.startswith(("turn/", "item/")):
+            touch = getattr(agent, "_touch_activity", None)
+            if touch is not None:
+                try:
+                    touch(f"codex app-server: {method}")
+                except Exception:
+                    logger.debug("_touch_activity raised", exc_info=True)
         params = note.get("params") or {}
         if not isinstance(params, dict):
             params = {}
@@ -723,6 +730,7 @@ def run_codex_app_server_turn(
             if session_db is not None:
                 session_db.set_codex_thread_id(agent.session_id, thread_id)
         turn_timeout, quiet_timeout = resolve_codex_app_server_timeouts()
+        agent._touch_activity("starting codex app-server turn")
         turn = agent._codex_session.run_turn(
             user_input=user_message,
             turn_timeout=turn_timeout,

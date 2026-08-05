@@ -23,6 +23,18 @@ from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
 
 logger = logging.getLogger(__name__)
 
+_RESPONSES_FUNCTION_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
+
+
+def _normalize_responses_function_name(name: str) -> str:
+    """Make persisted function names safe for the Responses wire format."""
+    name = name.strip()
+    if _RESPONSES_FUNCTION_NAME_RE.fullmatch(name):
+        return name
+    if name.startswith("mcp."):
+        name = "mcp__" + name.removeprefix("mcp.").replace(".", "__")
+    return re.sub(r"[^a-zA-Z0-9_-]", "_", name)
+
 
 def _classify_responses_issuer(
     *,
@@ -657,7 +669,7 @@ def _preflight_codex_input_items(
                 {
                     "type": "function_call",
                     "call_id": call_id.strip(),
-                    "name": name.strip(),
+                    "name": _normalize_responses_function_name(name),
                     "arguments": arguments,
                 }
             )

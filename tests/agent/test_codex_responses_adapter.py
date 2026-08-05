@@ -171,6 +171,38 @@ def test_preflight_codex_input_items_drops_short_id_for_github_responses():
     assert items[0]["content"] == [{"type": "output_text", "text": "pong"}]
 
 
+def test_preflight_codex_input_items_normalizes_persisted_mcp_name():
+    items = _preflight_codex_input_items([
+        {
+            "type": "function_call",
+            "call_id": "call_123",
+            "name": "mcp.hermes-tools.skills_list",
+            "arguments": "{}",
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call_123",
+            "output": "done",
+        },
+    ])
+
+    assert items[0]["name"] == "mcp__hermes-tools__skills_list"
+    assert items[0]["call_id"] == items[1]["call_id"] == "call_123"
+
+
+def test_preflight_codex_input_items_keeps_valid_function_name():
+    items = _preflight_codex_input_items([
+        {
+            "type": "function_call",
+            "call_id": "call_123",
+            "name": "mcp__hermes-tools__skills_list",
+            "arguments": "{}",
+        }
+    ])
+
+    assert items[0]["name"] == "mcp__hermes-tools__skills_list"
+
+
 def test_preflight_codex_api_kwargs_drops_oversized_message_id_end_to_end():
     kwargs = _preflight_codex_api_kwargs(
         {
@@ -302,7 +334,6 @@ def _xai_reasoning_only_response(reasoning_text):
             )
         ],
     )
-
 
 
 

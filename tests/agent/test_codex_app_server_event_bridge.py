@@ -39,6 +39,7 @@ def _make_stub_agent() -> SimpleNamespace:
         _emit_interim_assistant_message=MagicMock(
             name="_emit_interim_assistant_message"
         ),
+        _touch_activity=MagicMock(name="_touch_activity"),
     )
 
 
@@ -284,6 +285,16 @@ class TestAgentMessageInterimDispatch:
 
 class TestBridgeRobustness:
 
+    def test_turn_and_item_events_touch_activity(self):
+        agent = _make_stub_agent()
+        bridge = make_codex_app_server_event_bridge(agent)
+        bridge({"method": "turn/started", "params": {}})
+        bridge({"method": "item/reasoning/delta", "params": {"delta": "x"}})
+        assert [call.args[0] for call in agent._touch_activity.call_args_list] == [
+            "codex app-server: turn/started",
+            "codex app-server: item/reasoning/delta",
+        ]
+
     def test_missing_params_is_ignored(self):
         agent = _make_stub_agent()
         bridge = make_codex_app_server_event_bridge(agent)
@@ -329,6 +340,9 @@ class TestBridgeWiredInRuntime:
             def __init__(self, **kwargs):
                 captured.update(kwargs)
 
+            def ensure_started(self):
+                return "th1"
+
             def run_turn(self, user_input, **_):
                 from agent.transports.codex_app_server_session import TurnResult
                 return TurnResult(
@@ -356,6 +370,9 @@ class TestBridgeWiredInRuntime:
             _fire_stream_delta=MagicMock(),
             _fire_reasoning_delta=MagicMock(),
             _emit_interim_assistant_message=MagicMock(),
+            _touch_activity=MagicMock(),
+            show_commentary=True,
+            interim_assistant_callback=MagicMock(),
             _iters_since_skill=0,
             _skill_nudge_interval=0,
             valid_tool_names=set(),
@@ -388,6 +405,7 @@ class TestBridgeWiredInRuntime:
         assert callable(captured["on_event"]), (
             "on_event must be the bridge callable, not None or a sentinel"
         )
+        agent._touch_activity.assert_called_with("starting codex app-server turn")
 
         # And the bridge must actually drive the agent's callbacks when
         # fed a representative notification.
