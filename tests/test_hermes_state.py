@@ -96,6 +96,16 @@ class TestSessionLifecycle:
         assert session["model"] == "test-model"
         assert session["ended_at"] is None
 
+    def test_codex_thread_id_roundtrip(self, db):
+        db.create_session(session_id="s1", source="cli")
+        db.set_codex_thread_id("s1", "thread-1")
+
+        assert db.get_session("s1")["codex_thread_id"] == "thread-1"
+
+    def test_codex_thread_id_requires_session(self, db):
+        with pytest.raises(KeyError):
+            db.set_codex_thread_id("missing", "thread-1")
+
 
 
 

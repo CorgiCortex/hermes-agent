@@ -53,6 +53,8 @@ class FakeClient:
         if method == "thread/start":
             return {"thread": {"id": "thread-fake-001"},
                     "activePermissionProfile": {"id": "workspace-write"}}
+        if method == "thread/resume":
+            return {"thread": {"id": (params or {})["threadId"]}}
         if method == "turn/start":
             return {"turn": {"id": "turn-fake-001"}}
         if method == "turn/interrupt":
@@ -173,6 +175,26 @@ class TestLifecycle:
         method, params = next(r for r in client.requests if r[0] == "thread/start")
         assert params["cwd"] == "/tmp"
         assert "permissions" not in params  # see session.ensure_started() comment
+
+    def test_thread_resume_uses_persisted_id(self):
+        client = FakeClient()
+        s = make_session(client, resume_thread_id="thread-existing")
+
+        assert s.ensure_started() == "thread-existing"
+        assert ("thread/resume", {
+            "cwd": "/tmp",
+            "threadId": "thread-existing",
+        }) in client.requests
+        assert not any(method == "thread/start" for method, _ in client.requests)
+
+    def test_thread_resume_rejects_changed_id(self):
+        client = FakeClient()
+        client._request_handler = lambda _method, _params: {
+            "thread": {"id": "thread-other"}
+        }
+
+        with pytest.raises(session_mod.CodexAppServerError):
+            make_session(client, resume_thread_id="thread-existing").ensure_started()
 
     def test_close_idempotent(self):
         client = FakeClient()
@@ -895,4 +917,3 @@ class TestClassifyOAuthFailure:
         assert _classify_oauth_failure() is None
         assert _classify_oauth_failure("") is None
         assert _classify_oauth_failure("", None) is None  # type: ignore[arg-type]
-

@@ -103,6 +103,57 @@ def test_codex_runtime_passes_configured_timeouts(_load_config):
     )
 
 
+def test_codex_runtime_resumes_persisted_thread():
+    resume_ids = []
+
+    class FakeSession:
+        def __init__(self, *, resume_thread_id=None, **_kwargs):
+            resume_ids.append(resume_thread_id)
+            self.thread_id = resume_thread_id or "thread-created-001"
+
+        def ensure_started(self):
+            return self.thread_id
+
+        def run_turn(self, **_kwargs):
+            return _make_turn()
+
+        def close(self):
+            pass
+
+    with tempfile.TemporaryDirectory(prefix="codex_resume_") as tmp:
+        db = SessionDB(Path(tmp) / "state.db")
+        sid = "sess-codex-resume"
+        db.create_session(session_id=sid, source="telegram", model="codex")
+        config = {
+            "agent": {
+                "codex_app_server_turn_timeout": 0,
+                "codex_app_server_post_tool_quiet_timeout": 0,
+            }
+        }
+        with (
+            patch(
+                "agent.transports.codex_app_server_session.CodexAppServerSession",
+                FakeSession,
+            ),
+            patch("hermes_cli.config.load_config_readonly", return_value=config),
+        ):
+            for _ in range(2):
+                agent = _make_agent(session_db=db, session_id=sid)
+                agent._codex_session = None
+                agent.session_cwd = tmp
+                run_codex_app_server_turn(
+                    agent,
+                    user_message="hello",
+                    original_user_message="hello",
+                    messages=[{"role": "user", "content": "hello"}],
+                    effective_task_id="task-1",
+                )
+
+        assert resume_ids == [None, "thread-created-001"]
+        assert db.get_session(sid)["codex_thread_id"] == "thread-created-001"
+        db.close()
+
+
 def test_codex_user_interrupt_is_reported_and_cleared():
     agent = _make_agent(session_db=None)
     turn = _make_turn()
@@ -185,6 +236,7 @@ def test_codex_turn_persists_each_message_exactly_once():
     finally:
         import shutil
 
+        db.close()
         shutil.rmtree(tmp)
 
 

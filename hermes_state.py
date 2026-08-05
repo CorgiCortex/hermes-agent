@@ -4544,6 +4544,21 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             row = cursor.fetchone()
         return dict(row) if row else None
 
+    def set_codex_thread_id(self, session_id: str, thread_id: str) -> None:
+        """Persist the Codex app-server thread owned by a Hermes session."""
+        if not session_id or not thread_id:
+            raise ValueError("session_id and thread_id are required")
+
+        def _do(conn):
+            result = conn.execute(
+                "UPDATE sessions SET codex_thread_id = ? WHERE id = ?",
+                (thread_id, session_id),
+            )
+            if result.rowcount != 1:
+                raise KeyError(f"Session not found: {session_id}")
+
+        self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
+
     def resolve_session_id(self, session_id_or_prefix: str) -> Optional[str]:
         """Resolve an exact or uniquely prefixed session ID to the full ID.
 

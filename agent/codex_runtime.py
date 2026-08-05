@@ -652,10 +652,19 @@ def run_codex_app_server_turn(
     # Lazy session: one CodexAppServerSession per AIAgent instance.
     # Spawned on first turn, reused across turns, closed at AIAgent
     # shutdown (see _cleanup hook).
-    if not hasattr(agent, "_codex_session") or agent._codex_session is None:
+    codex_session_created = (
+        not hasattr(agent, "_codex_session") or agent._codex_session is None
+    )
+    if codex_session_created:
         from agent.runtime_cwd import resolve_agent_cwd
 
         cwd = getattr(agent, "session_cwd", None) or str(resolve_agent_cwd())
+        session_db = agent._session_db
+        resume_thread_id = None
+        if session_db is not None:
+            agent._ensure_db_session()
+            session = session_db.get_session(agent.session_id)
+            resume_thread_id = session["codex_thread_id"] if session else None
         # Approval callback: defer to Hermes' standard prompt flow if a
         # CLI thread has installed one. Gateway / cron contexts get the
         # codex-side fail-closed default.
@@ -695,6 +704,7 @@ def run_codex_app_server_turn(
         # Supersedes the narrower item/started-only bridge from #38835.
         agent._codex_session = CodexAppServerSession(
             cwd=cwd,
+            resume_thread_id=resume_thread_id,
             approval_callback=approval_callback,
             request_routing=_ServerRequestRouting(
                 auto_approve_exec=auto_approve_requests,
@@ -708,6 +718,10 @@ def run_codex_app_server_turn(
     # return reaches us. Do NOT append again — that would duplicate.
 
     try:
+        if codex_session_created:
+            thread_id = agent._codex_session.ensure_started()
+            if session_db is not None:
+                session_db.set_codex_thread_id(agent.session_id, thread_id)
         turn_timeout, quiet_timeout = resolve_codex_app_server_timeouts()
         turn = agent._codex_session.run_turn(
             user_input=user_message,

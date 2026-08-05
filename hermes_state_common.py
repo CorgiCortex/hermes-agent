@@ -145,6 +145,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     chat_id TEXT,
     chat_type TEXT,
     thread_id TEXT,
+    codex_thread_id TEXT,
     display_name TEXT,
     origin_json TEXT,
     expiry_finalized INTEGER DEFAULT 0,
