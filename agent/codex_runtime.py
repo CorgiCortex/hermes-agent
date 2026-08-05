@@ -937,6 +937,13 @@ def run_codex_app_server_turn(
 
     return {
         "final_response": turn.final_text,
+        # The gateway verifies that this exact text reached the platform
+        # before suppressing its normal final send.
+        "response_previewed": bool(
+            turn.final_text
+            and getattr(agent, "show_commentary", True)
+            and getattr(agent, "interim_assistant_callback", None) is not None
+        ),
         "messages": messages,
         "api_calls": api_calls,
         "completed": not turn.interrupted and turn.error is None,
