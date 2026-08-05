@@ -76,6 +76,31 @@ def test_codex_success_flushes_and_reports_persisted():
     assert result["agent_persisted"] is True
 
 
+def test_codex_final_marks_preview_only_on_visible_interim_path():
+    agent = _make_agent(session_db=None)
+    agent.show_commentary = True
+    agent.interim_assistant_callback = MagicMock()
+
+    previewed = run_codex_app_server_turn(
+        agent,
+        user_message="hello",
+        original_user_message="hello",
+        messages=[{"role": "user", "content": "hello"}],
+        effective_task_id="task-1",
+    )
+    agent.show_commentary = False
+    hidden = run_codex_app_server_turn(
+        agent,
+        user_message="hello",
+        original_user_message="hello",
+        messages=[{"role": "user", "content": "hello"}],
+        effective_task_id="task-2",
+    )
+
+    assert previewed["response_previewed"] is True
+    assert hidden["response_previewed"] is False
+
+
 @patch(
     "hermes_cli.config.load_config_readonly",
     return_value={
