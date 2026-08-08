@@ -195,6 +195,21 @@ def test_generic_submit_failure_finishes_attempt_and_releases_guard(monkeypatch)
     assert "submit-fail" not in scheduler.get_running_job_ids()
 
 
+def test_tick_recovers_interrupted_records_without_restart(monkeypatch):
+    import cron.scheduler as scheduler
+
+    recovered = []
+    monkeypatch.setattr(
+        scheduler,
+        "recover_interrupted_executions",
+        lambda: recovered.append(True) or 0,
+    )
+    monkeypatch.setattr(scheduler, "get_due_jobs", lambda: [])
+
+    assert scheduler.tick(verbose=False) == 0
+    assert recovered == [True]
+
+
 def test_run_one_job_records_running_then_terminal(monkeypatch):
     import cron.scheduler as scheduler
 
