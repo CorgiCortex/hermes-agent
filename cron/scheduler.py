@@ -282,7 +282,12 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
 }
 
 from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run, claim_dispatch, heartbeat_run_claim
-from cron.executions import create_execution, finish_execution, mark_execution_running
+from cron.executions import (
+    create_execution,
+    finish_execution,
+    mark_execution_running,
+    recover_interrupted_executions,
+)
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -4138,6 +4143,13 @@ def tick(
         return 0
 
     try:
+        recovered = recover_interrupted_executions()
+        if recovered:
+            logger.warning(
+                "Marked %d interrupted cron execution(s) unknown before tick",
+                recovered,
+            )
+
         if can_dispatch is not None and not can_dispatch():
             logger.debug("Cron dispatch paused while gateway drains existing work")
             return 0
