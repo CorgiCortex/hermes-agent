@@ -49,6 +49,20 @@ class TestSteerAcceptance:
         assert agent.steer("go ahead and check the logs") is True
         assert agent._pending_steer == "go ahead and check the logs"
 
+    def test_codex_app_server_uses_native_active_turn_steer(self):
+        agent = _bare_agent()
+        calls = []
+        agent.api_mode = "codex_app_server"
+        agent._codex_session = type(
+            "_CodexSession",
+            (),
+            {"request_steer": lambda self, text: calls.append(text) or True},
+        )()
+
+        assert agent.steer("also check the tests") is True
+        assert calls == ["also check the tests"]
+        assert agent._pending_steer is None
+
 
 
 

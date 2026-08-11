@@ -3092,12 +3092,10 @@ class AIAgent:
 
     def steer(self, text: str) -> bool:
         """
-        Inject a user message into the next tool result without interrupting.
+        Inject a user message into the active turn without interrupting.
 
-        Unlike interrupt(), this does NOT stop the current tool call. The
-        text is stashed and the agent loop appends it to the LAST tool
-        result's content once the current tool batch finishes. The model
-        sees the steer as part of the tool output on its next iteration.
+        Codex app-server receives the text through its native ``turn/steer``
+        operation. Other runtimes stash it for the next tool-result boundary.
 
         Thread-safe: callable from gateway/CLI/TUI threads. Multiple calls
         before the drain point concatenate with newlines.
@@ -3111,6 +3109,25 @@ class AIAgent:
         if not text or not text.strip():
             return False
         cleaned = text.strip()
+
+        if getattr(self, "api_mode", None) == "codex_app_server":
+            _redirect_lock = getattr(self, "_pending_redirect_lock", None)
+            if _redirect_lock is not None:
+                with _redirect_lock:
+                    if self._interrupt_requested:
+                        return False
+            elif self._interrupt_requested:
+                return False
+            _codex_session = getattr(self, "_codex_session", None)
+            _native_steer = getattr(_codex_session, "request_steer", None)
+            if not callable(_native_steer):
+                return False
+            try:
+                return bool(_native_steer(cleaned))
+            except Exception:
+                logger.debug("Codex app-server turn/steer failed", exc_info=True)
+                return False
+
         _lock = getattr(self, "_pending_steer_lock", None)
         if _lock is None:
             # Test stubs that built AIAgent via object.__new__ skip __init__.
@@ -3147,21 +3164,7 @@ class AIAgent:
         # Codex owns its internal reasoning/tool loop, so use its first-class
         # active-turn steering protocol rather than interrupting the subprocess.
         if getattr(self, "api_mode", None) == "codex_app_server":
-            _codex_session = getattr(self, "_codex_session", None)
-            _native_steer = getattr(_codex_session, "request_steer", None)
-            if callable(_native_steer):
-                _redirect_lock = getattr(self, "_pending_redirect_lock", None)
-                if _redirect_lock is not None:
-                    with _redirect_lock:
-                        if self._interrupt_requested:
-                            return False
-                elif self._interrupt_requested:
-                    return False
-                try:
-                    return bool(_native_steer(cleaned))
-                except Exception:
-                    logger.debug("Codex app-server turn/steer failed", exc_info=True)
-                    return False
+            return self.steer(cleaned)
 
         # Never kill a tool merely to deliver conversational guidance. The
         # existing steer drain puts it on the final tool result before the next
