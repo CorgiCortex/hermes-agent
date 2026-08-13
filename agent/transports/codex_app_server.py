@@ -214,7 +214,7 @@ class CodexAppServerClient:
         self,
         method: str,
         params: Optional[dict] = None,
-        timeout: float = 30.0,
+        timeout: Optional[float] = 30.0,
     ) -> dict:
         """Send a JSON-RPC request and block on the response. Returns `result`,
         raises CodexAppServerError on `error`."""

@@ -273,3 +273,31 @@ def test_codex_app_server_with_live_thread_still_routes_to_codex(monkeypatch):
     )
 
     assert diverted == [True]
+
+
+def test_hermes_fallback_summary_uses_codex_responses(monkeypatch):
+    from agent.context_compressor import ContextCompressor
+
+    compressor = ContextCompressor(
+        model="test-model",
+        api_mode="codex_app_server",
+        quiet_mode=True,
+    )
+    captured = {}
+
+    def call_llm(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content="## Active Task\nUser asked X")
+                )
+            ]
+        )
+
+    monkeypatch.setattr("agent.context_compressor.call_llm", call_llm)
+
+    assert compressor._generate_summary(
+        [{"role": "user", "content": "hi"}]
+    )
+    assert captured["main_runtime"]["api_mode"] == "codex_responses"

@@ -30,6 +30,7 @@ class FakeClient:
         self.codex_bin = codex_bin
         self.codex_home = codex_home
         self.requests: list[tuple[str, dict]] = []
+        self.request_timeouts: list[Optional[float]] = []
         self.notifications_responses: list[dict] = []
         self.responses: list[tuple[Any, dict]] = []
         self.error_responses: list[tuple[Any, int, str]] = []
@@ -45,8 +46,14 @@ class FakeClient:
         return {"userAgent": "fake/0.0.0", "codexHome": "/tmp",
                 "platformOs": "linux", "platformFamily": "unix"}
 
-    def request(self, method: str, params: Optional[dict] = None, timeout: float = 30.0):
+    def request(
+        self,
+        method: str,
+        params: Optional[dict] = None,
+        timeout: Optional[float] = 30.0,
+    ):
         self.requests.append((method, params or {}))
+        self.request_timeouts.append(timeout)
         if self._request_handler is not None:
             return self._request_handler(method, params or {})
         # Sensible defaults for protocol methods used by the session
@@ -175,6 +182,7 @@ class TestLifecycle:
         method, params = next(r for r in client.requests if r[0] == "thread/start")
         assert params["cwd"] == "/tmp"
         assert "permissions" not in params  # see session.ensure_started() comment
+        assert client.request_timeouts == [15]
 
     def test_thread_resume_uses_persisted_id(self):
         client = FakeClient()
@@ -186,6 +194,7 @@ class TestLifecycle:
             "threadId": "thread-existing",
         }) in client.requests
         assert not any(method == "thread/start" for method, _ in client.requests)
+        assert client.request_timeouts == [None]
 
     def test_thread_resume_rejects_changed_id(self):
         client = FakeClient()
