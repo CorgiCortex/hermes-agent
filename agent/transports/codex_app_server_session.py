@@ -348,7 +348,13 @@ class CodexAppServerSession:
         params: dict[str, Any] = {"cwd": self._cwd}
         if self._resume_thread_id:
             params["threadId"] = self._resume_thread_id
-        result = self._client.request(method, params, timeout=15)
+        # Restoring a persisted thread may need to hydrate a large history.
+        # Do not apply thread/start's short handshake deadline to that work.
+        result = self._client.request(
+            method,
+            params,
+            timeout=None if self._resume_thread_id else 15,
+        )
         # Cross-fill thread.id/sessionId — different codex versions have
         # serialized this under either key. Mirrors openclaw beta.8's
         # tolerance fix so future codex drops/renames don't KeyError us
