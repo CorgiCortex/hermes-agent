@@ -72,6 +72,50 @@ class TestApiModeAccepted:
         assert agent.api_mode == "codex_app_server"
 
 
+class TestCodexSessionLifecycle:
+    def test_release_clients_closes_and_detaches_codex_session(self):
+        agent = _make_codex_agent()
+        session = MagicMock()
+        agent._codex_session = session
+
+        agent.release_clients()
+
+        session.close.assert_called_once_with()
+        assert agent._codex_session is None
+
+    def test_close_closes_and_detaches_codex_session(self):
+        agent = _make_codex_agent()
+        session = MagicMock()
+        agent._codex_session = session
+
+        agent.close()
+
+        session.close.assert_called_once_with()
+        assert agent._codex_session is None
+
+    def test_repeated_cleanup_closes_codex_session_once(self):
+        agent = _make_codex_agent()
+        session = MagicMock()
+        agent._codex_session = session
+
+        agent.release_clients()
+        agent.close()
+
+        session.close.assert_called_once_with()
+        assert agent._codex_session is None
+
+    def test_cleanup_detaches_codex_session_when_close_raises(self):
+        agent = _make_codex_agent()
+        session = MagicMock()
+        session.close.side_effect = RuntimeError("close failed")
+        agent._codex_session = session
+
+        agent.release_clients()
+
+        session.close.assert_called_once_with()
+        assert agent._codex_session is None
+
+
 class TestRunConversationCodexPath:
     def test_run_conversation_returns_codex_shape(self, fake_session):
         agent = _make_codex_agent()
