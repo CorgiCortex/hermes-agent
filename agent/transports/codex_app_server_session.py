@@ -578,6 +578,11 @@ class CodexAppServerSession:
         result.turn_id = (ts.get("turn") or {}).get("id")
         with self._active_turn_lock:
             self._active_turn_id = result.turn_id
+        # Deployments running long-blocking tools (multi-agent wait_agent,
+        # hour-scale scripts) can raise the per-turn ceiling via env.
+        env_turn_timeout = os.environ.get("HERMES_CODEX_TURN_TIMEOUT_SECONDS")
+        if env_turn_timeout:
+            turn_timeout = float(env_turn_timeout)
         deadline = time.monotonic() + turn_timeout
         turn_complete = False
         # Post-tool watchdog state. last_tool_completion_at is set whenever
@@ -734,6 +739,12 @@ class CodexAppServerSession:
                 # status update, etc.) means codex is still producing
                 # output — clear the quiet timer so we don't fast-fail.
                 if projection.messages or projection.final_text is not None:
+                    last_tool_completion_at = None
+                elif method == "item/started":
+                    # A newly started item (e.g. a long-blocking wait_agent
+                    # or shell command) means codex is busy executing a tool,
+                    # not wedged after one — disarm the quiet watchdog until
+                    # that item completes.
                     last_tool_completion_at = None
             if projection.final_text is not None:
                 # Codex can emit multiple agentMessage items in one turn
