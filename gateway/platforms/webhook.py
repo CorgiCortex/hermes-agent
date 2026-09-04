@@ -401,6 +401,53 @@ class WebhookAdapter(BasePlatformAdapter):
             success=False, error=f"Unknown deliver type: {deliver_type}"
         )
 
+    async def _send_cross_platform_attachment(
+        self,
+        chat_id: str,
+        file_path: str,
+        method_name: str,
+        **kwargs,
+    ) -> SendResult:
+        """Forward webhook response attachments to the configured platform."""
+        delivery = self._delivery_info.get(chat_id, {})
+        deliver_type = delivery.get("deliver", "log")
+        if deliver_type in {"log", "github_comment"}:
+            return SendResult(
+                success=False,
+                error=f"Delivery target {deliver_type} does not support attachments",
+            )
+        # Source-platform reply metadata belongs to the synthetic webhook
+        # event; the destination thread is resolved from deliver_extra below.
+        kwargs.pop("metadata", None)
+        kwargs.pop("reply_to", None)
+        return await self._deliver_cross_platform(
+            deliver_type,
+            file_path,
+            delivery,
+            method_name=method_name,
+            **kwargs,
+        )
+
+    async def send_voice(self, chat_id: str, audio_path: str, **kwargs) -> SendResult:
+        return await self._send_cross_platform_attachment(
+            chat_id, audio_path, "send_voice", **kwargs
+        )
+
+    async def send_video(self, chat_id: str, video_path: str, **kwargs) -> SendResult:
+        return await self._send_cross_platform_attachment(
+            chat_id, video_path, "send_video", **kwargs
+        )
+
+    async def send_document(self, chat_id: str, file_path: str, **kwargs) -> SendResult:
+        return await self._send_cross_platform_attachment(
+            chat_id, file_path, "send_document", **kwargs
+        )
+
+    async def send_image_file(self, chat_id: str, image_path: str, **kwargs) -> SendResult:
+        return await self._send_cross_platform_attachment(
+            chat_id, image_path, "send_image_file", **kwargs
+        )
+
     def _prune_delivery_info(self, now: float) -> None:
         """Drop delivery_info entries older than the idempotency TTL.
 
@@ -1372,7 +1419,13 @@ class WebhookAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=str(e))
 
     async def _deliver_cross_platform(
-        self, platform_name: str, content: str, delivery: dict
+        self,
+        platform_name: str,
+        content: str,
+        delivery: dict,
+        *,
+        method_name: str = "send",
+        **kwargs,
     ) -> SendResult:
         """Route response to another platform (telegram, discord, etc.)."""
         if not self.gateway_runner:
@@ -1425,4 +1478,5 @@ class WebhookAdapter(BasePlatformAdapter):
         if thread_id:
             metadata = {"thread_id": thread_id}
 
-        return await adapter.send(chat_id, content, metadata=metadata)
+        method = getattr(adapter, method_name)
+        return await method(chat_id, content, metadata=metadata, **kwargs)

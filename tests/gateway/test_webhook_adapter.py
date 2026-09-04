@@ -810,6 +810,50 @@ class TestDeliverCrossPlatformThreadId:
         )
 
 
+class TestWebhookCrossPlatformAttachments:
+    """Webhook agent attachments must use the configured target adapter."""
+
+    @pytest.mark.parametrize(
+        ("method_name", "path"),
+        [
+            ("send_voice", "/tmp/message.ogg"),
+            ("send_video", "/tmp/clip.mp4"),
+            ("send_document", "/tmp/report.md"),
+            ("send_image_file", "/tmp/chart.png"),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_attachment_is_forwarded_to_delivery_adapter(
+        self, method_name, path
+    ):
+        adapter = _make_adapter()
+        target = MagicMock()
+        target_method = AsyncMock(return_value=SendResult(success=True))
+        setattr(target, method_name, target_method)
+        runner = MagicMock()
+        runner.adapters = {Platform("feishu"): target}
+        runner.config.get_home_channel.return_value = None
+        adapter.gateway_runner = runner
+
+        chat_id = "webhook:trigger:event-1"
+        adapter._delivery_info[chat_id] = {
+            "deliver": "feishu",
+            "deliver_extra": {"chat_id": "oc_target", "thread_id": "target-thread"},
+        }
+
+        result = await getattr(adapter, method_name)(
+            chat_id,
+            path,
+            metadata={"thread_id": "webhook-thread"},
+            reply_to="webhook-message",
+        )
+
+        assert result.success is True
+        target_method.assert_awaited_once_with(
+            "oc_target", path, metadata={"thread_id": "target-thread"}
+        )
+
+
 class TestInsecureNoAuthSafetyRail:
     """connect() refuses to start when INSECURE_NO_AUTH is combined with a
     non-loopback bind. Guards against accidentally exposing an unauthenticated
