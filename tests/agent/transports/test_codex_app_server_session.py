@@ -948,3 +948,25 @@ class TestClassifyOAuthFailure:
         assert _classify_oauth_failure() is None
         assert _classify_oauth_failure("") is None
         assert _classify_oauth_failure("", None) is None  # type: ignore[arg-type]
+
+@pytest.mark.parametrize("resume_thread_id", [None, "existing-thread"])
+def test_delegated_context_is_sent_on_thread_initialization(resume_thread_id):
+    client = FakeClient()
+    context = "Frozen rules: alpha, beta. Missing evidence must remain unknown."
+    session = make_session(
+        client, resume_thread_id=resume_thread_id,
+        developer_instructions=context,
+    )
+    session.ensure_started()
+    session.ensure_started()
+    method, params = client.requests[0]
+    assert method == ("thread/resume" if resume_thread_id else "thread/start")
+    assert params["developerInstructions"] == context
+    assert len(client.requests) == 1
+
+
+def test_unset_developer_instructions_preserve_server_configuration():
+    client = FakeClient()
+    session = make_session(client)
+    session.ensure_started()
+    assert "developerInstructions" not in client.requests[0][1]

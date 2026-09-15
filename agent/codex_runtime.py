@@ -712,6 +712,7 @@ def run_codex_app_server_turn(
         agent._codex_session = CodexAppServerSession(
             cwd=cwd,
             resume_thread_id=resume_thread_id,
+            developer_instructions=agent.ephemeral_system_prompt,
             approval_callback=approval_callback,
             request_routing=_ServerRequestRouting(
                 auto_approve_exec=auto_approve_requests,

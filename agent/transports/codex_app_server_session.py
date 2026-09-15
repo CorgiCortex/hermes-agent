@@ -278,6 +278,7 @@ class CodexAppServerSession:
         codex_bin: str = "codex",
         codex_home: Optional[str] = None,
         resume_thread_id: Optional[str] = None,
+        developer_instructions: Optional[str] = None,
         permission_profile: Optional[str] = None,
         approval_callback: Optional[Callable[..., str]] = None,
         on_event: Optional[Callable[[dict], None]] = None,
@@ -288,6 +289,7 @@ class CodexAppServerSession:
         self._codex_bin = codex_bin
         self._codex_home = codex_home
         self._resume_thread_id = resume_thread_id
+        self._developer_instructions = developer_instructions
         self._permission_profile = (
             permission_profile or _HERMES_TO_CODEX_PERMISSION_PROFILE.get(
                 os.environ.get("HERMES_TERMINAL_SECURITY_MODE", "auto"),
@@ -346,6 +348,8 @@ class CodexAppServerSession:
         # ~/.codex/config.toml the same way they would for any codex usage.
         method = "thread/resume" if self._resume_thread_id else "thread/start"
         params: dict[str, Any] = {"cwd": self._cwd}
+        if self._developer_instructions:
+            params["developerInstructions"] = self._developer_instructions
         if self._resume_thread_id:
             params["threadId"] = self._resume_thread_id
         # Restoring a persisted thread may need to hydrate a large history.
