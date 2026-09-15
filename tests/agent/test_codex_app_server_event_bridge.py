@@ -365,6 +365,7 @@ class TestBridgeWiredInRuntime:
         # attributes and we mock the heavy ones to keep the test fast.
         agent = SimpleNamespace(
             session_cwd=None,
+            ephemeral_system_prompt="Delegated context: frozen decision facts.",
             _codex_session=None,
             tool_progress_callback=MagicMock(),
             _fire_stream_delta=MagicMock(),
@@ -405,6 +406,7 @@ class TestBridgeWiredInRuntime:
         assert callable(captured["on_event"]), (
             "on_event must be the bridge callable, not None or a sentinel"
         )
+        assert captured["developer_instructions"] == agent.ephemeral_system_prompt
         agent._touch_activity.assert_called_with("starting codex app-server turn")
 
         # And the bridge must actually drive the agent's callbacks when
