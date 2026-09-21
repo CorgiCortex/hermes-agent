@@ -163,10 +163,14 @@ class CodexAppServerClient:
         client_title: str = "Hermes Agent",
         client_version: str = "0.1",
         capabilities: Optional[dict] = None,
-        timeout: float = 10.0,
+        timeout: float = 60.0,
     ) -> dict:
         """Send `initialize` + `initialized` handshake. Returns the server's
-        InitializeResponse (userAgent, codexHome, platformFamily, platformOs)."""
+        InitializeResponse (userAgent, codexHome, platformFamily, platformOs).
+
+        This deadline includes subprocess startup and loading persisted state;
+        an existing Codex home can take over 30 seconds before serving RPCs.
+        """
         if self._initialized:
             raise RuntimeError("already initialized")
         params = {
