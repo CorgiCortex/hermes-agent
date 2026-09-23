@@ -197,6 +197,8 @@ class WebhookAdapter(BasePlatformAdapter):
         self._dynamic_routes_mtime: float = 0.0
         self._routes: Dict[str, dict] = dict(self._static_routes)
         self._runner = None
+        self._lifecycle = None
+        self._lifecycle_events = {}
         self._serial_groups: dict[tuple[str, str], str] = {}
         self._delivery_groups: dict[str, tuple[str, str]] = {}
         # Routes already warned about legacy V1 body-only signatures
@@ -739,6 +741,44 @@ class WebhookAdapter(BasePlatformAdapter):
                     {"error": "Cannot parse body"}, status=400
                 )
 
+        # Signed control requests use the same route/profile authentication but
+        # never render a prompt, consume model quota or create a session.
+        if route_config.get("serial_event_key") and payload.get("operation"):
+            ledger = self._delivery_lifecycle()
+            operation = payload["operation"]
+            if operation not in {"status", "cancel"}:
+                return web.json_response({"error": "invalid lifecycle operation"}, status=400)
+            identities = payload["deliveries"]
+            if not isinstance(identities, list) or not 1 <= len(identities) <= 100:
+                return web.json_response({"error": "invalid lifecycle batch"}, status=400)
+            results = []
+            for item in identities:
+                identity, scope = item["identity"], item["scope"]
+                if not all(isinstance(v, str) and v.strip() for v in (identity, scope)):
+                    return web.json_response({"error": "invalid lifecycle identity"}, status=400)
+                row = ledger.get(route_name, identity)
+                if row is not None and row["scope"] != scope:
+                    return web.json_response({"error": "lifecycle scope mismatch"}, status=409)
+                if operation == "cancel":
+                    ledger.cancel(route_name, identity, scope)
+                    # Tombstone first: an in-flight POST can never admit this work.
+                    if (row is not None and row["chat"] in self._lifecycle_events
+                            and not ledger.has_other_work(row["chat"], route_name, identity)):
+                        event = self._lifecycle_events[row["chat"]]
+                        from gateway.session import build_session_key
+                        key = build_session_key(event.source,
+                            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
+                            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False))
+                        await self.cancel_session_processing(key)
+                    row = ledger.get(route_name, identity)
+                active = self._serial_groups.get((route_name, scope))
+                results.append({"identity": identity, "serial_key": scope,
+                    "status": "unknown" if row is None else row["status"],
+                    "active_chat_id": None if row is None else row["chat"],
+                    "scope_busy": active is not None,
+                    "consumer_running": row is not None and row["chat"] in self._delivery_groups})
+            return web.json_response({"deliveries": results})
+
         # Check event type filter
         event_type = (
             request.headers.get("X-GitHub-Event", "")
@@ -856,6 +896,13 @@ class WebhookAdapter(BasePlatformAdapter):
                 return web.json_response({"error": "serial key must be nonempty"}, status=400)
             if route_config.get("deliver_only"):
                 return web.json_response({"error": "serial key requires agent delivery"}, status=400)
+            if route_config.get("serial_event_key"):
+                previous = self._delivery_lifecycle().get(route_name, delivery_id)
+                if previous is not None:
+                    if previous["scope"] != serial_value:
+                        return web.json_response({"error": "delivery scope mismatch"}, status=409)
+                    return web.json_response({"status": previous["status"],
+                        "serial_key": serial_value, "active_chat_id": previous["chat"]}, status=200)
             serial_group = (route_name, serial_value)
             active = self._serial_groups.get(serial_group)
             if active is not None:
@@ -883,6 +930,7 @@ class WebhookAdapter(BasePlatformAdapter):
                         steered = self.gateway_runner.steer_webhook(event)
                         if steered:
                             seen.add(identity)
+                            self._delivery_lifecycle().admit(route_name, delivery_id, serial_value, active)
                 return web.json_response(
                     {"status": "busy", "serial_key": serial_value,
                      "active_chat_id": active, "steered": steered}, status=202,
@@ -1021,6 +1069,9 @@ class WebhookAdapter(BasePlatformAdapter):
         if serial_group is not None:
             self._serial_groups[serial_group] = session_chat_id
             self._delivery_groups[session_chat_id] = serial_group
+        if serial_group is not None and route_config.get("serial_event_key"):
+            self._delivery_lifecycle().admit(route_name, delivery_id, serial_group[1], session_chat_id)
+            self._lifecycle_events[session_chat_id] = event
         task = asyncio.create_task(self._dispatch_delivery(event))
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
@@ -1037,14 +1088,35 @@ class WebhookAdapter(BasePlatformAdapter):
             status=202,
         )
 
+    def sender_manages_resume(self, chat_id: str) -> bool:
+        parts = chat_id.split(":", 2)
+        return (len(parts) == 3 and parts[0] == "webhook"
+                and bool(self._routes.get(parts[1], {}).get("serial_event_key")))
+
+    def _delivery_lifecycle(self):
+        from hermes_constants import get_hermes_home
+        from gateway.platforms.webhook_lifecycle import WebhookLifecycle
+        if self._lifecycle is None:
+            self._lifecycle = WebhookLifecycle(get_hermes_home() / "webhook-lifecycle.sqlite3")
+        return self._lifecycle
+
     async def _dispatch_delivery(self, event: "MessageEvent") -> None:
         try:
+            if event.source.chat_id in self._lifecycle_events:
+                group = self._delivery_groups[event.source.chat_id]
+                identity = event.source.chat_id.removeprefix(f"webhook:{group[0]}:")
+                if self._delivery_lifecycle().get(group[0], identity)["status"] == "cancelled":
+                    self._release_serial_group(event.source.chat_id)
+                    return
             await self.handle_message(event)
         except BaseException:
             self._release_serial_group(event.source.chat_id)
             raise
 
     def _release_serial_group(self, chat_id: str) -> None:
+        if chat_id in self._lifecycle_events:
+            self._delivery_lifecycle().finish(chat_id)
+            self._lifecycle_events.pop(chat_id)
         self._steered_events.pop(chat_id, None)
         group = self._delivery_groups.pop(chat_id, None)
         if group is not None:
