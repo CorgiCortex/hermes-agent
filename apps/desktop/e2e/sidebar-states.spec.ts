@@ -140,9 +140,6 @@ test.describe('sidebar states — subagent and background dot coexist', () => {
     await composer.type('E2E_SIDEBAR_CROSS', { delay: 20 })
     await page.keyboard.press('Enter')
 
-    // Smart approval asks before running the sentinel-waiting shell loop.
-    await page.getByRole('button', { name: /^Run / }).click({ timeout: 30_000 })
-
     // Wait for the user's message to appear.
     await page.waitForFunction(
       () => (document.body.textContent ?? '').includes('E2E_SIDEBAR_CROSS'),
