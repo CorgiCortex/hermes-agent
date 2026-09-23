@@ -197,6 +197,8 @@ class WebhookAdapter(BasePlatformAdapter):
         self._dynamic_routes_mtime: float = 0.0
         self._routes: Dict[str, dict] = dict(self._static_routes)
         self._runner = None
+        self._serial_groups: dict[tuple[str, str], str] = {}
+        self._delivery_groups: dict[str, tuple[str, str]] = {}
         # Routes already warned about legacy V1 body-only signatures
         # (once-per-route so a busy sender doesn't spam the log).
         self._v1_signature_warned: set[str] = set()
@@ -846,6 +848,28 @@ class WebhookAdapter(BasePlatformAdapter):
             ),
         )
 
+        # Reserve at acceptance, before model startup. The sender retains busy
+        # deliveries durably and retries after this run actually completes.
+        serial_field = route_config.get("serial_key")
+        serial_group = None
+        if serial_field is not None:
+            if self._message_handler is None:
+                return web.json_response({"error": "agent handler is not ready"}, status=503)
+            if serial_field not in payload:
+                return web.json_response({"error": "missing serial key"}, status=400)
+            serial_value = payload[serial_field]
+            if not isinstance(serial_value, str) or not serial_value.strip():
+                return web.json_response({"error": "serial key must be nonempty"}, status=400)
+            if route_config.get("deliver_only"):
+                return web.json_response({"error": "serial key requires agent delivery"}, status=400)
+            serial_group = (route_name, serial_value)
+            active = self._serial_groups.get(serial_group)
+            if active is not None:
+                return web.json_response(
+                    {"status": "busy", "serial_key": serial_value,
+                     "active_chat_id": active}, status=202,
+                )
+
         # ── Idempotency ─────────────────────────────────────────
         # Skip duplicate deliveries (webhook retries).
         now = time.time()
@@ -966,19 +990,36 @@ class WebhookAdapter(BasePlatformAdapter):
         # once the agent run actually finishes (``handle_message`` itself is
         # fire-and-forget: it spawns ``_process_message_background`` and
         # returns before the run starts, so nothing can be closed here).
-        task = asyncio.create_task(self.handle_message(event))
+        if serial_group is not None:
+            self._serial_groups[serial_group] = session_chat_id
+            self._delivery_groups[session_chat_id] = serial_group
+        task = asyncio.create_task(self._dispatch_delivery(event))
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
 
         return web.json_response(
             {
                 "status": "accepted",
+                "serial_key": None if serial_group is None else serial_group[1],
+                "active_chat_id": session_chat_id,
                 "route": route_name,
                 "event": event_type,
                 "delivery_id": delivery_id,
             },
             status=202,
         )
+
+    async def _dispatch_delivery(self, event: "MessageEvent") -> None:
+        try:
+            await self.handle_message(event)
+        except BaseException:
+            self._release_serial_group(event.source.chat_id)
+            raise
+
+    def _release_serial_group(self, chat_id: str) -> None:
+        group = self._delivery_groups.pop(chat_id, None)
+        if group is not None:
+            del self._serial_groups[group]
 
     async def on_processing_complete(
         self, event: "MessageEvent", outcome: Any
@@ -1002,7 +1043,10 @@ class WebhookAdapter(BasePlatformAdapter):
         ``end_session()`` is first-reason-wins and no-ops on an already-ended
         row, so this never clobbers a ``compression``/``agent_close`` reason.
         """
-        await self._end_webhook_session(event, event.source.chat_id)
+        try:
+            await self._end_webhook_session(event, event.source.chat_id)
+        finally:
+            self._release_serial_group(event.source.chat_id)
 
     async def _end_webhook_session(
         self, event: "MessageEvent", session_chat_id: str
