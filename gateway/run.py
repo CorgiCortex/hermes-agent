@@ -8348,6 +8348,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return text
         return (enriched_text or text).strip()
 
+    def steer_webhook(self, event: MessageEvent) -> bool:
+        """Offer urgent signed work to the active turn without starting another run."""
+        if event.source.platform != Platform.WEBHOOK or not event.text.strip():
+            raise ValueError("webhook steering requires a nonempty webhook message")
+        if self._draining or self._busy_input_mode != "steer":
+            return False
+        if not self._is_user_authorized(event.source):
+            return False
+        session_key = self._session_key_for_source(event.source)
+        state = self._peek_session_state(session_key)
+        if state is None or state.turn.agent is None or state.turn.agent is _AGENT_PENDING_SENTINEL:
+            return False
+        accepted = bool(state.turn.agent.steer(event.text))
+        logger.info("webhook priority steer session=%s event=%s accepted=%s", session_key, event.message_id, accepted)
+        return accepted
+
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
         # --- Authorization gate (#17775) ---
         # The cold path (_handle_message) checks _is_user_authorized before

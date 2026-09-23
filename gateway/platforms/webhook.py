@@ -197,6 +197,8 @@ class WebhookAdapter(BasePlatformAdapter):
         self._dynamic_routes_mtime: float = 0.0
         self._routes: Dict[str, dict] = dict(self._static_routes)
         self._runner = None
+        self._serial_groups: dict[tuple[str, str], str] = {}
+        self._delivery_groups: dict[str, tuple[str, str]] = {}
         # Routes already warned about legacy V1 body-only signatures
         # (once-per-route so a busy sender doesn't spam the log).
         self._v1_signature_warned: set[str] = set()
@@ -220,6 +222,7 @@ class WebhookAdapter(BasePlatformAdapter):
         # Idempotency: TTL cache of recently processed delivery IDs.
         # Prevents duplicate agent runs when webhook providers retry.
         self._seen_deliveries: Dict[str, float] = {}
+        self._steered_events: Dict[str, set[str]] = {}
         self._idempotency_ttl: int = 3600  # 1 hour
         self._seen_deliveries_next_prune_at: float = 0.0
 
@@ -720,13 +723,6 @@ class WebhookAdapter(BasePlatformAdapter):
                     {"error": "Invalid signature"}, status=401
                 )
 
-        # ── Rate limiting (after auth) ───────────────────────────
-        now = time.time()
-        if not self._record_rate_limit_hit(route_name, now):
-            return web.json_response(
-                {"error": "Rate limit exceeded"}, status=429
-            )
-
         # Parse payload
         try:
             payload = json.loads(raw_body)
@@ -846,6 +842,53 @@ class WebhookAdapter(BasePlatformAdapter):
             ),
         )
 
+        # Reserve at acceptance, before model startup. The sender retains busy
+        # deliveries durably and retries after this run actually completes.
+        serial_field = route_config.get("serial_key")
+        serial_group = None
+        if serial_field is not None:
+            if self._message_handler is None:
+                return web.json_response({"error": "agent handler is not ready"}, status=503)
+            if serial_field not in payload:
+                return web.json_response({"error": "missing serial key"}, status=400)
+            serial_value = payload[serial_field]
+            if not isinstance(serial_value, str) or not serial_value.strip():
+                return web.json_response({"error": "serial key must be nonempty"}, status=400)
+            if route_config.get("deliver_only"):
+                return web.json_response({"error": "serial key requires agent delivery"}, status=400)
+            serial_group = (route_name, serial_value)
+            active = self._serial_groups.get(serial_group)
+            if active is not None:
+                steered = False
+                steer_field = route_config.get("serial_steer_key")
+                if steer_field is not None and type(payload.get(steer_field)) is not bool:
+                    return web.json_response({"error": "serial steer flag must be boolean"}, status=400)
+                if steer_field is not None and payload[steer_field]:
+                    event_key = route_config["serial_event_key"]
+                    identity = payload[event_key]
+                    if not isinstance(identity, str) or not identity.strip():
+                        return web.json_response({"error": "invalid serial event identity"}, status=400)
+                    seen = self._steered_events.setdefault(active, set())
+                    steered = identity in seen
+                    if not steered and self.gateway_runner is not None:
+                        source = self.build_source(
+                            chat_id=active, chat_name=f"webhook/{route_name}",
+                            chat_type="webhook", user_id=f"webhook:{route_name}", user_name=route_name,
+                        )
+                        if profile:
+                            source.profile = profile
+                        steer_prompt = self._render_prompt(prompt_template, payload, event_type, route_name)
+                        event = MessageEvent(text=steer_prompt, message_type=MessageType.TEXT,
+                                             source=source, raw_message=payload, message_id=identity)
+                        steered = self.gateway_runner.steer_webhook(event)
+                        if steered:
+                            seen.add(identity)
+                return web.json_response(
+                    {"status": "busy", "serial_key": serial_value,
+                     "active_chat_id": active, "steered": steered}, status=202,
+                    headers={"Retry-After": "60"},
+                )
+
         # ── Idempotency ─────────────────────────────────────────
         # Skip duplicate deliveries (webhook retries).
         now = time.time()
@@ -856,6 +899,15 @@ class WebhookAdapter(BasePlatformAdapter):
             return web.json_response(
                 {"status": "duplicate", "delivery_id": delivery_id},
                 status=200,
+            )
+
+        # Only admitted new work consumes the route's model-work quota.
+        # No await separates deduplication and admission; rejected IDs remain retryable.
+        if not self._record_rate_limit_hit(route_name, now):
+            self._seen_deliveries.pop(delivery_id)
+            return web.json_response(
+                {"error": "Rate limit exceeded"}, status=429,
+                headers={"Retry-After": str(int(_RATE_WINDOW_SECONDS))},
             )
 
         # ── Direct delivery mode (deliver_only) ─────────────────
@@ -966,19 +1018,37 @@ class WebhookAdapter(BasePlatformAdapter):
         # once the agent run actually finishes (``handle_message`` itself is
         # fire-and-forget: it spawns ``_process_message_background`` and
         # returns before the run starts, so nothing can be closed here).
-        task = asyncio.create_task(self.handle_message(event))
+        if serial_group is not None:
+            self._serial_groups[serial_group] = session_chat_id
+            self._delivery_groups[session_chat_id] = serial_group
+        task = asyncio.create_task(self._dispatch_delivery(event))
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
 
         return web.json_response(
             {
                 "status": "accepted",
+                "serial_key": None if serial_group is None else serial_group[1],
+                "active_chat_id": session_chat_id,
                 "route": route_name,
                 "event": event_type,
                 "delivery_id": delivery_id,
             },
             status=202,
         )
+
+    async def _dispatch_delivery(self, event: "MessageEvent") -> None:
+        try:
+            await self.handle_message(event)
+        except BaseException:
+            self._release_serial_group(event.source.chat_id)
+            raise
+
+    def _release_serial_group(self, chat_id: str) -> None:
+        self._steered_events.pop(chat_id, None)
+        group = self._delivery_groups.pop(chat_id, None)
+        if group is not None:
+            del self._serial_groups[group]
 
     async def on_processing_complete(
         self, event: "MessageEvent", outcome: Any
@@ -1002,7 +1072,10 @@ class WebhookAdapter(BasePlatformAdapter):
         ``end_session()`` is first-reason-wins and no-ops on an already-ended
         row, so this never clobbers a ``compression``/``agent_close`` reason.
         """
-        await self._end_webhook_session(event, event.source.chat_id)
+        try:
+            await self._end_webhook_session(event, event.source.chat_id)
+        finally:
+            self._release_serial_group(event.source.chat_id)
 
     async def _end_webhook_session(
         self, event: "MessageEvent", session_chat_id: str
