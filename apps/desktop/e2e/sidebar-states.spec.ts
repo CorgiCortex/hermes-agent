@@ -211,6 +211,9 @@ test.describe('sidebar states — cross-session dot transition', () => {
     await composer.type('E2E_SIDEBAR_CROSS', { delay: 20 })
     await page.keyboard.press('Enter')
 
+    // Smart approval asks before running the sentinel-waiting shell loop.
+    await page.getByRole('button', { name: /^Run / }).click({ timeout: 30_000 })
+
     // Wait for the background dot to appear.
     await expect
       .poll(
