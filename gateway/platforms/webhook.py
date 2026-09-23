@@ -722,13 +722,6 @@ class WebhookAdapter(BasePlatformAdapter):
                     {"error": "Invalid signature"}, status=401
                 )
 
-        # ── Rate limiting (after auth) ───────────────────────────
-        now = time.time()
-        if not self._record_rate_limit_hit(route_name, now):
-            return web.json_response(
-                {"error": "Rate limit exceeded"}, status=429
-            )
-
         # Parse payload
         try:
             payload = json.loads(raw_body)
@@ -868,6 +861,7 @@ class WebhookAdapter(BasePlatformAdapter):
                 return web.json_response(
                     {"status": "busy", "serial_key": serial_value,
                      "active_chat_id": active}, status=202,
+                    headers={"Retry-After": "60"},
                 )
 
         # ── Idempotency ─────────────────────────────────────────
@@ -880,6 +874,15 @@ class WebhookAdapter(BasePlatformAdapter):
             return web.json_response(
                 {"status": "duplicate", "delivery_id": delivery_id},
                 status=200,
+            )
+
+        # Only admitted new work consumes the route's model-work quota.
+        # No await separates deduplication and admission; rejected IDs remain retryable.
+        if not self._record_rate_limit_hit(route_name, now):
+            self._seen_deliveries.pop(delivery_id)
+            return web.json_response(
+                {"error": "Rate limit exceeded"}, status=429,
+                headers={"Retry-After": str(int(_RATE_WINDOW_SECONDS))},
             )
 
         # ── Direct delivery mode (deliver_only) ─────────────────
