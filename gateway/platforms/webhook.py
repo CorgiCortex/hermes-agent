@@ -222,6 +222,7 @@ class WebhookAdapter(BasePlatformAdapter):
         # Idempotency: TTL cache of recently processed delivery IDs.
         # Prevents duplicate agent runs when webhook providers retry.
         self._seen_deliveries: Dict[str, float] = {}
+        self._steered_events: Dict[str, set[str]] = {}
         self._idempotency_ttl: int = 3600  # 1 hour
         self._seen_deliveries_next_prune_at: float = 0.0
 
@@ -858,9 +859,33 @@ class WebhookAdapter(BasePlatformAdapter):
             serial_group = (route_name, serial_value)
             active = self._serial_groups.get(serial_group)
             if active is not None:
+                steered = False
+                steer_field = route_config.get("serial_steer_key")
+                if steer_field is not None and type(payload.get(steer_field)) is not bool:
+                    return web.json_response({"error": "serial steer flag must be boolean"}, status=400)
+                if steer_field is not None and payload[steer_field]:
+                    event_key = route_config["serial_event_key"]
+                    identity = payload[event_key]
+                    if not isinstance(identity, str) or not identity.strip():
+                        return web.json_response({"error": "invalid serial event identity"}, status=400)
+                    seen = self._steered_events.setdefault(active, set())
+                    steered = identity in seen
+                    if not steered and self.gateway_runner is not None:
+                        source = self.build_source(
+                            chat_id=active, chat_name=f"webhook/{route_name}",
+                            chat_type="webhook", user_id=f"webhook:{route_name}", user_name=route_name,
+                        )
+                        if profile:
+                            source.profile = profile
+                        steer_prompt = self._render_prompt(prompt_template, payload, event_type, route_name)
+                        event = MessageEvent(text=steer_prompt, message_type=MessageType.TEXT,
+                                             source=source, raw_message=payload, message_id=identity)
+                        steered = self.gateway_runner.steer_webhook(event)
+                        if steered:
+                            seen.add(identity)
                 return web.json_response(
                     {"status": "busy", "serial_key": serial_value,
-                     "active_chat_id": active}, status=202,
+                     "active_chat_id": active, "steered": steered}, status=202,
                     headers={"Retry-After": "60"},
                 )
 
@@ -1020,6 +1045,7 @@ class WebhookAdapter(BasePlatformAdapter):
             raise
 
     def _release_serial_group(self, chat_id: str) -> None:
+        self._steered_events.pop(chat_id, None)
         group = self._delivery_groups.pop(chat_id, None)
         if group is not None:
             del self._serial_groups[group]
