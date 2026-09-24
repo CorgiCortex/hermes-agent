@@ -10072,6 +10072,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 continue
 
+            from gateway.platforms.webhook import WebhookAdapter
+            if isinstance(adapter, WebhookAdapter) and adapter.sender_manages_resume(source.chat_id):
+                # Durable sender reconciliation owns recovery; never run both paths.
+                continue
+
             # Validate the session owner against the current allowlist
             # before auto-resuming. A session created before
             # TELEGRAM_ALLOWED_USERS (or equivalent) was configured, or
