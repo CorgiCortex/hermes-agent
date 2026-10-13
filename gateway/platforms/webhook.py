@@ -197,6 +197,10 @@ class WebhookAdapter(BasePlatformAdapter):
         self._dynamic_routes_mtime: float = 0.0
         self._routes: Dict[str, dict] = dict(self._static_routes)
         self._runner = None
+        self._lifecycle = None
+        self._lifecycle_events = {}
+        self._serial_groups: dict[tuple[str, str], str] = {}
+        self._delivery_groups: dict[str, tuple[str, str]] = {}
         # Routes already warned about legacy V1 body-only signatures
         # (once-per-route so a busy sender doesn't spam the log).
         self._v1_signature_warned: set[str] = set()
@@ -220,6 +224,7 @@ class WebhookAdapter(BasePlatformAdapter):
         # Idempotency: TTL cache of recently processed delivery IDs.
         # Prevents duplicate agent runs when webhook providers retry.
         self._seen_deliveries: Dict[str, float] = {}
+        self._steered_events: Dict[str, set[str]] = {}
         self._idempotency_ttl: int = 3600  # 1 hour
         self._seen_deliveries_next_prune_at: float = 0.0
 
@@ -399,6 +404,53 @@ class WebhookAdapter(BasePlatformAdapter):
         logger.warning("[webhook] Unknown deliver type: %s", deliver_type)
         return SendResult(
             success=False, error=f"Unknown deliver type: {deliver_type}"
+        )
+
+    async def _send_cross_platform_attachment(
+        self,
+        chat_id: str,
+        file_path: str,
+        method_name: str,
+        **kwargs,
+    ) -> SendResult:
+        """Forward webhook response attachments to the configured platform."""
+        delivery = self._delivery_info.get(chat_id, {})
+        deliver_type = delivery.get("deliver", "log")
+        if deliver_type in {"log", "github_comment"}:
+            return SendResult(
+                success=False,
+                error=f"Delivery target {deliver_type} does not support attachments",
+            )
+        # Source-platform reply metadata belongs to the synthetic webhook
+        # event; the destination thread is resolved from deliver_extra below.
+        kwargs.pop("metadata", None)
+        kwargs.pop("reply_to", None)
+        return await self._deliver_cross_platform(
+            deliver_type,
+            file_path,
+            delivery,
+            method_name=method_name,
+            **kwargs,
+        )
+
+    async def send_voice(self, chat_id: str, audio_path: str, **kwargs) -> SendResult:
+        return await self._send_cross_platform_attachment(
+            chat_id, audio_path, "send_voice", **kwargs
+        )
+
+    async def send_video(self, chat_id: str, video_path: str, **kwargs) -> SendResult:
+        return await self._send_cross_platform_attachment(
+            chat_id, video_path, "send_video", **kwargs
+        )
+
+    async def send_document(self, chat_id: str, file_path: str, **kwargs) -> SendResult:
+        return await self._send_cross_platform_attachment(
+            chat_id, file_path, "send_document", **kwargs
+        )
+
+    async def send_image_file(self, chat_id: str, image_path: str, **kwargs) -> SendResult:
+        return await self._send_cross_platform_attachment(
+            chat_id, image_path, "send_image_file", **kwargs
         )
 
     def _prune_delivery_info(self, now: float) -> None:
@@ -673,13 +725,6 @@ class WebhookAdapter(BasePlatformAdapter):
                     {"error": "Invalid signature"}, status=401
                 )
 
-        # ── Rate limiting (after auth) ───────────────────────────
-        now = time.time()
-        if not self._record_rate_limit_hit(route_name, now):
-            return web.json_response(
-                {"error": "Rate limit exceeded"}, status=429
-            )
-
         # Parse payload
         try:
             payload = json.loads(raw_body)
@@ -695,6 +740,44 @@ class WebhookAdapter(BasePlatformAdapter):
                 return web.json_response(
                     {"error": "Cannot parse body"}, status=400
                 )
+
+        # Signed control requests use the same route/profile authentication but
+        # never render a prompt, consume model quota or create a session.
+        if route_config.get("serial_event_key") and payload.get("operation"):
+            ledger = self._delivery_lifecycle()
+            operation = payload["operation"]
+            if operation not in {"status", "cancel"}:
+                return web.json_response({"error": "invalid lifecycle operation"}, status=400)
+            identities = payload["deliveries"]
+            if not isinstance(identities, list) or not 1 <= len(identities) <= 100:
+                return web.json_response({"error": "invalid lifecycle batch"}, status=400)
+            results = []
+            for item in identities:
+                identity, scope = item["identity"], item["scope"]
+                if not all(isinstance(v, str) and v.strip() for v in (identity, scope)):
+                    return web.json_response({"error": "invalid lifecycle identity"}, status=400)
+                row = ledger.get(route_name, identity)
+                if row is not None and row["scope"] != scope:
+                    return web.json_response({"error": "lifecycle scope mismatch"}, status=409)
+                if operation == "cancel":
+                    ledger.cancel(route_name, identity, scope)
+                    # Tombstone first: an in-flight POST can never admit this work.
+                    if (row is not None and row["chat"] in self._lifecycle_events
+                            and not ledger.has_other_work(row["chat"], route_name, identity)):
+                        event = self._lifecycle_events[row["chat"]]
+                        from gateway.session import build_session_key
+                        key = build_session_key(event.source,
+                            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
+                            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False))
+                        await self.cancel_session_processing(key)
+                    row = ledger.get(route_name, identity)
+                active = self._serial_groups.get((route_name, scope))
+                results.append({"identity": identity, "serial_key": scope,
+                    "status": "unknown" if row is None else row["status"],
+                    "active_chat_id": None if row is None else row["chat"],
+                    "scope_busy": active is not None,
+                    "consumer_running": row is not None and row["chat"] in self._delivery_groups})
+            return web.json_response({"deliveries": results})
 
         # Check event type filter
         event_type = (
@@ -799,6 +882,61 @@ class WebhookAdapter(BasePlatformAdapter):
             ),
         )
 
+        # Reserve at acceptance, before model startup. The sender retains busy
+        # deliveries durably and retries after this run actually completes.
+        serial_field = route_config.get("serial_key")
+        serial_group = None
+        if serial_field is not None:
+            if self._message_handler is None:
+                return web.json_response({"error": "agent handler is not ready"}, status=503)
+            if serial_field not in payload:
+                return web.json_response({"error": "missing serial key"}, status=400)
+            serial_value = payload[serial_field]
+            if not isinstance(serial_value, str) or not serial_value.strip():
+                return web.json_response({"error": "serial key must be nonempty"}, status=400)
+            if route_config.get("deliver_only"):
+                return web.json_response({"error": "serial key requires agent delivery"}, status=400)
+            if route_config.get("serial_event_key"):
+                previous = self._delivery_lifecycle().get(route_name, delivery_id)
+                if previous is not None:
+                    if previous["scope"] != serial_value:
+                        return web.json_response({"error": "delivery scope mismatch"}, status=409)
+                    return web.json_response({"status": previous["status"],
+                        "serial_key": serial_value, "active_chat_id": previous["chat"]}, status=200)
+            serial_group = (route_name, serial_value)
+            active = self._serial_groups.get(serial_group)
+            if active is not None:
+                steered = False
+                steer_field = route_config.get("serial_steer_key")
+                if steer_field is not None and type(payload.get(steer_field)) is not bool:
+                    return web.json_response({"error": "serial steer flag must be boolean"}, status=400)
+                if steer_field is not None and payload[steer_field]:
+                    event_key = route_config["serial_event_key"]
+                    identity = payload[event_key]
+                    if not isinstance(identity, str) or not identity.strip():
+                        return web.json_response({"error": "invalid serial event identity"}, status=400)
+                    seen = self._steered_events.setdefault(active, set())
+                    steered = identity in seen
+                    if not steered and self.gateway_runner is not None:
+                        source = self.build_source(
+                            chat_id=active, chat_name=f"webhook/{route_name}",
+                            chat_type="webhook", user_id=f"webhook:{route_name}", user_name=route_name,
+                        )
+                        if profile:
+                            source.profile = profile
+                        steer_prompt = self._render_prompt(prompt_template, payload, event_type, route_name)
+                        event = MessageEvent(text=steer_prompt, message_type=MessageType.TEXT,
+                                             source=source, raw_message=payload, message_id=identity)
+                        steered = self.gateway_runner.steer_webhook(event)
+                        if steered:
+                            seen.add(identity)
+                            self._delivery_lifecycle().admit(route_name, delivery_id, serial_value, active)
+                return web.json_response(
+                    {"status": "busy", "serial_key": serial_value,
+                     "active_chat_id": active, "steered": steered}, status=202,
+                    headers={"Retry-After": "60"},
+                )
+
         # ── Idempotency ─────────────────────────────────────────
         # Skip duplicate deliveries (webhook retries).
         now = time.time()
@@ -809,6 +947,15 @@ class WebhookAdapter(BasePlatformAdapter):
             return web.json_response(
                 {"status": "duplicate", "delivery_id": delivery_id},
                 status=200,
+            )
+
+        # Only admitted new work consumes the route's model-work quota.
+        # No await separates deduplication and admission; rejected IDs remain retryable.
+        if not self._record_rate_limit_hit(route_name, now):
+            self._seen_deliveries.pop(delivery_id)
+            return web.json_response(
+                {"error": "Rate limit exceeded"}, status=429,
+                headers={"Retry-After": str(int(_RATE_WINDOW_SECONDS))},
             )
 
         # ── Direct delivery mode (deliver_only) ─────────────────
@@ -919,19 +1066,61 @@ class WebhookAdapter(BasePlatformAdapter):
         # once the agent run actually finishes (``handle_message`` itself is
         # fire-and-forget: it spawns ``_process_message_background`` and
         # returns before the run starts, so nothing can be closed here).
-        task = asyncio.create_task(self.handle_message(event))
+        if serial_group is not None:
+            self._serial_groups[serial_group] = session_chat_id
+            self._delivery_groups[session_chat_id] = serial_group
+        if serial_group is not None and route_config.get("serial_event_key"):
+            self._delivery_lifecycle().admit(route_name, delivery_id, serial_group[1], session_chat_id)
+            self._lifecycle_events[session_chat_id] = event
+        task = asyncio.create_task(self._dispatch_delivery(event))
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
 
         return web.json_response(
             {
                 "status": "accepted",
+                "serial_key": None if serial_group is None else serial_group[1],
+                "active_chat_id": session_chat_id,
                 "route": route_name,
                 "event": event_type,
                 "delivery_id": delivery_id,
             },
             status=202,
         )
+
+    def sender_manages_resume(self, chat_id: str) -> bool:
+        parts = chat_id.split(":", 2)
+        return (len(parts) == 3 and parts[0] == "webhook"
+                and bool(self._routes.get(parts[1], {}).get("serial_event_key")))
+
+    def _delivery_lifecycle(self):
+        from hermes_constants import get_hermes_home
+        from gateway.platforms.webhook_lifecycle import WebhookLifecycle
+        if self._lifecycle is None:
+            self._lifecycle = WebhookLifecycle(get_hermes_home() / "webhook-lifecycle.sqlite3")
+        return self._lifecycle
+
+    async def _dispatch_delivery(self, event: "MessageEvent") -> None:
+        try:
+            if event.source.chat_id in self._lifecycle_events:
+                group = self._delivery_groups[event.source.chat_id]
+                identity = event.source.chat_id.removeprefix(f"webhook:{group[0]}:")
+                if self._delivery_lifecycle().get(group[0], identity)["status"] == "cancelled":
+                    self._release_serial_group(event.source.chat_id)
+                    return
+            await self.handle_message(event)
+        except BaseException:
+            self._release_serial_group(event.source.chat_id)
+            raise
+
+    def _release_serial_group(self, chat_id: str) -> None:
+        if chat_id in self._lifecycle_events:
+            self._delivery_lifecycle().finish(chat_id)
+            self._lifecycle_events.pop(chat_id)
+        self._steered_events.pop(chat_id, None)
+        group = self._delivery_groups.pop(chat_id, None)
+        if group is not None:
+            del self._serial_groups[group]
 
     async def on_processing_complete(
         self, event: "MessageEvent", outcome: Any
@@ -955,7 +1144,10 @@ class WebhookAdapter(BasePlatformAdapter):
         ``end_session()`` is first-reason-wins and no-ops on an already-ended
         row, so this never clobbers a ``compression``/``agent_close`` reason.
         """
-        await self._end_webhook_session(event, event.source.chat_id)
+        try:
+            await self._end_webhook_session(event, event.source.chat_id)
+        finally:
+            self._release_serial_group(event.source.chat_id)
 
     async def _end_webhook_session(
         self, event: "MessageEvent", session_chat_id: str
@@ -1372,7 +1564,13 @@ class WebhookAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=str(e))
 
     async def _deliver_cross_platform(
-        self, platform_name: str, content: str, delivery: dict
+        self,
+        platform_name: str,
+        content: str,
+        delivery: dict,
+        *,
+        method_name: str = "send",
+        **kwargs,
     ) -> SendResult:
         """Route response to another platform (telegram, discord, etc.)."""
         if not self.gateway_runner:
@@ -1425,4 +1623,5 @@ class WebhookAdapter(BasePlatformAdapter):
         if thread_id:
             metadata = {"thread_id": thread_id}
 
-        return await adapter.send(chat_id, content, metadata=metadata)
+        method = getattr(adapter, method_name)
+        return await method(chat_id, content, metadata=metadata, **kwargs)

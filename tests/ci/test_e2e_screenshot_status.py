@@ -34,7 +34,7 @@ def test_status_selects_only_new_explicit_screenshots_and_all_diffs(tmp_path):
     result = status[0]["results"][0]
     assert result["kind"] == "info"
     assert result["summary"] == "1 new screenshot vs main; 1 visual diff."
-    assert _mod.EVIDENCE_START in result["detail"]
+    assert "available in the test artifacts" in result["detail"]
     assert "already-on-main.png" not in result["detail"]
     assert result["link"] == "https://github.test/artifacts/1"
 

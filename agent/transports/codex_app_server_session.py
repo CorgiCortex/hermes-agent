@@ -590,12 +590,6 @@ class CodexAppServerSession:
         # within post_tool_quiet_timeout and the turn hasn't completed, we
         # fast-fail and retire the session.
         last_tool_completion_at: Optional[float] = None
-        # Last meaningful signal in this turn, used at the deadline to tell
-        # "assistant message finished but turn/completed never arrived" (a
-        # codex protocol quirk — safe to accept the text) apart from "a tool
-        # was started or finished after the text" (the turn was truncated
-        # mid-flow — must surface as a timeout, never as success).
-        last_signal: Optional[str] = None
 
         while time.monotonic() < deadline and not turn_complete:
             if self._interrupt_event.is_set():
@@ -684,10 +678,8 @@ class CodexAppServerSession:
                     if proj.is_tool_iteration:
                         result.tool_iterations += 1
                         last_tool_completion_at = time.monotonic()
-                        last_signal = "tool_done"
                     if proj.final_text is not None:
                         result.final_text = proj.final_text
-                        last_signal = "text"
                         if _has_turn_aborted_marker(proj.final_text):
                             turn_complete = True
                             result.interrupted = True
@@ -742,27 +734,22 @@ class CodexAppServerSession:
                 # Arm/refresh the post-tool quiet watchdog whenever a
                 # tool-shaped item completes.
                 last_tool_completion_at = time.monotonic()
-                last_signal = "tool_done"
             else:
                 # Any non-tool projected activity (assistant message,
                 # status update, etc.) means codex is still producing
                 # output — clear the quiet timer so we don't fast-fail.
                 if projection.messages or projection.final_text is not None:
                     last_tool_completion_at = None
-                    if projection.final_text is None:
-                        last_signal = "activity"
                 elif method == "item/started":
                     # A newly started item (e.g. a long-blocking wait_agent
                     # or shell command) means codex is busy executing a tool,
                     # not wedged after one — disarm the quiet watchdog until
                     # that item completes.
                     last_tool_completion_at = None
-                    last_signal = "tool_start"
             if projection.final_text is not None:
                 # Codex can emit multiple agentMessage items in one turn
                 # (e.g. partial then final). Take the last one as canonical.
                 result.final_text = projection.final_text
-                last_signal = "text"
                 # Some codex builds tear a turn down by emitting a
                 # `<turn_aborted>` marker in the agent message text and
                 # never sending turn/completed. Treat the marker itself
@@ -800,25 +787,6 @@ class CodexAppServerSession:
                                 f"turn ended status={turn_status}", err_msg
                             )
 
-        if (
-            not turn_complete
-            and not result.interrupted
-            and result.final_text
-            and result.error is None
-            and last_signal == "text"
-        ):
-            # Only when the assistant text is the LAST thing codex produced.
-            # If a tool started or finished after that text, the turn was
-            # truncated mid-flow (e.g. an hour-scale script cut off by the
-            # ceiling) and accepting the stale text would report a silently
-            # incomplete run as success.
-            logger.warning(
-                "codex app-server turn reached deadline after a completed "
-                "assistant message but before turn/completed; accepting "
-                "the assistant text as the terminal response"
-            )
-            turn_complete = True
-
         if not turn_complete and not result.interrupted:
             # Hit the deadline. Issue interrupt to stop wasted compute, and
             # tell the caller to retire the session — a turn that never
@@ -828,8 +796,7 @@ class CodexAppServerSession:
             result.interrupted = True
             if not result.error:
                 result.error = self._format_error_with_stderr(
-                    f"turn timed out after {turn_timeout}s "
-                    f"(last signal: {last_signal or 'none'})"
+                    f"turn timed out after {turn_timeout}s"
                 )
             result.should_retire = True
 

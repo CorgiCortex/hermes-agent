@@ -24,10 +24,13 @@ masks exactly that bug (the first version of this fix shipped that way).
 
 import asyncio
 
+from aiohttp.test_utils import TestClient, TestServer
+from aiohttp import web
+
 import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
-from gateway.platforms.base import MessageEvent, MessageType
+from gateway.platforms.base import MessageEvent
 from gateway.platforms.webhook import WebhookAdapter, _INSECURE_NO_AUTH
 from gateway.session import SessionSource, SessionStore
 
@@ -71,24 +74,6 @@ def _make_store(tmp_path) -> SessionStore:
     return store
 
 
-def _make_event(adapter: WebhookAdapter, delivery_id: str, text: str) -> MessageEvent:
-    session_chat_id = f"webhook:alerts:{delivery_id}"
-    source = adapter.build_source(
-        chat_id=session_chat_id,
-        chat_name="webhook/alerts",
-        chat_type="webhook",
-        user_id="webhook:alerts",
-        user_name="alerts",
-    )
-    return MessageEvent(
-        text=text,
-        message_type=MessageType.TEXT,
-        source=source,
-        raw_message={"message": text},
-        message_id=delivery_id,
-    )
-
-
 async def _drain_background_tasks(adapter: WebhookAdapter, timeout: float = 5.0) -> None:
     """Wait for the adapter's spawned processing task(s) to finish."""
     deadline = asyncio.get_event_loop().time() + timeout
@@ -99,7 +84,8 @@ async def _drain_background_tasks(adapter: WebhookAdapter, timeout: float = 5.0)
 
 
 @pytest.mark.asyncio
-async def test_completed_webhook_delivery_closes_its_session(tmp_path):
+@pytest.mark.parametrize("outcome", ["success", "failure", "cancelled"])
+async def test_completed_webhook_delivery_closes_its_session(tmp_path, outcome):
     """After a webhook run finishes (REAL dispatch path), ended_at is set."""
     store = _make_store(tmp_path)
     runner = _FakeRunner(store)
@@ -110,6 +96,7 @@ async def test_completed_webhook_delivery_closes_its_session(tmp_path):
                 "secret": _INSECURE_NO_AUTH,
                 "prompt": "Alert: {message}",
                 "deliver": "log",
+                "serial_key": "scope",
             }
         }
     )
@@ -121,39 +108,52 @@ async def test_completed_webhook_delivery_closes_its_session(tmp_path):
     # on_processing_complete hook.  The handler creates the session row, just
     # like GatewayRunner._handle_message does at routing time.
     created = {}
+    release = asyncio.Event()
+    both_started = asyncio.Event()
 
     async def _message_handler(event: MessageEvent):
         entry = store.get_or_create_session(event.source)
-        created["session_id"] = entry.session_id
-        return ""  # webhook deliver=log — nothing to send back
+        created[event.source.chat_id] = (entry.session_id, event)
+        if len(created) == 2:
+            both_started.set()
+        await release.wait()
+        if outcome == "failure":
+            raise RuntimeError("intentional worker failure")
+        if outcome == "cancelled":
+            raise asyncio.CancelledError()
+        return ""
 
     adapter._message_handler = _message_handler
+    app = web.Application()
+    app.router.add_post("/webhooks/{route_name}", adapter._handle_webhook)
+    async with TestClient(TestServer(app)) as client:
+        async def deliver(scope, attempt):
+            response = await client.post("/webhooks/alerts", json={"scope": scope, "message": "review"}, headers={"X-Request-ID": attempt})
+            assert response.status == 202
+            return await response.json()
 
-    event = _make_event(adapter, "alert-close-001", "Alert: server on fire")
-
-    # Exactly what _handle_webhook schedules.
-    await adapter.handle_message(event)
-    # handle_message is fire-and-forget: the session must NOT be expected to
-    # exist yet.  (Guards against reintroducing a close wrapped around
-    # handle_message itself, which ran before the row existed and no-op'd.)
-    await _drain_background_tasks(adapter)
-
-    session_id = created["session_id"]
-    row = store._db.get_session(session_id)
-    assert row is not None
-
-    # INVARIANT: a completed webhook session must be closed so prune can reap it.
-    assert row["ended_at"] is not None, (
-        "webhook session was never closed — ended_at is NULL, so "
-        "prune_sessions can never reap it (the ghost-session leak)"
-    )
-    assert row["end_reason"] == "webhook_complete"
-    assert runner.evicted_session_keys == [
-        runner._session_key_for_source(event.source)
-    ]
-
-    # And the closed row is actually prunable, unlike the pre-fix leak.
-    pruned = store._db.prune_sessions(older_than_days=0, source="webhook")
-    assert pruned >= 1
+        first = await deliver("instrument:A", "a1")
+        busy = await deliver("instrument:A", "a2")
+        second = await deliver("instrument:B", "b1")
+        assert first["status"] == second["status"] == "accepted"
+        assert busy["status"] == "busy"
+        assert busy["active_chat_id"] == first["active_chat_id"]
+        assert second["active_chat_id"] != first["active_chat_id"]
+        await asyncio.wait_for(both_started.wait(), timeout=5)
+        assert len(created) == 2
+        for session_id, event in created.values():
+            assert store._db.get_session(session_id)["ended_at"] is None
+        release.set()
+        await _drain_background_tasks(adapter)
+        assert not adapter._serial_groups
+        for session_id, event in created.values():
+            row = store._db.get_session(session_id)
+            assert row["ended_at"] is not None
+            assert row["end_reason"] == "webhook_complete"
+            assert runner._session_key_for_source(event.source) in runner.evicted_session_keys
+        following = await deliver("instrument:A", "a3")
+        assert following["status"] == "accepted"
+        await _drain_background_tasks(adapter)
+        assert not adapter._serial_groups
+    assert store._db.prune_sessions(older_than_days=0, source="webhook") >= 3
     store._db.close()
-

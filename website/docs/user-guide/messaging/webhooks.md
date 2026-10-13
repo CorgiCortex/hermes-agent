@@ -89,6 +89,21 @@ Routes define how different webhook sources are handled. Each route is a named e
 | `deliver_extra` | No | Additional delivery config — keys depend on `deliver` type (e.g. `repo`, `pr_number`, `chat_id`). Values support the same `{dot.notation}` templates as `prompt`. |
 | `deliver_only` | No | If `true`, skip the agent entirely — the rendered `prompt` template becomes the literal message that gets delivered. Zero LLM cost, sub-second delivery. See [Direct Delivery Mode](#direct-delivery-mode) for use cases. Requires `deliver` to be a real target (not `log`). |
 
+### Serial delivery groups
+
+Set `serial_key: scope` on an agent route to use the payload's nonempty `scope`
+string as a group. Different groups run independently. Acceptance reserves the
+route/group before model startup; another delivery to that group returns HTTP 202
+with `status: busy`, `serial_key`, and the existing `active_chat_id`, without
+starting a run. Accepted responses contain the same identity fields with
+`status: accepted`.
+
+The sender must retain busy and uncompleted work durably and retry with a new
+request ID. This response is a dispatch receipt, not completion. The group is
+released when the actual agent run finishes (including failure or cancellation).
+A process restart clears running groups; the sender redelivers unacknowledged work.
+`serial_key` requires agent delivery and cannot be combined with `deliver_only`.
+
 ### Full example
 
 ```yaml

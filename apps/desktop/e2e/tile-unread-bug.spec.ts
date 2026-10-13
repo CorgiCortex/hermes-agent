@@ -50,6 +50,9 @@ async function startTurnAndSwitchAway(page: import('@playwright/test').Page) {
   await composer.type('E2E_SIDEBAR_CROSS', { delay: 20 })
   await page.keyboard.press('Enter')
 
+  // Approve the held background command before waiting for its running state.
+  await page.getByRole('button', { name: /^Run / }).click({ timeout: 30_000 })
+
   // Wait for the user's message to appear.
   await page.waitForFunction(
     () => (document.body.textContent ?? '').includes('E2E_SIDEBAR_CROSS'),

@@ -10,8 +10,6 @@ import shutil
 from pathlib import Path
 
 SOURCE = "playwright e2e"
-EVIDENCE_START = "<!-- hermes-e2e-evidence:start -->"
-EVIDENCE_END = "<!-- hermes-e2e-evidence:end -->"
 
 
 def _files(root: Path, pattern: str) -> list[Path]:
@@ -104,7 +102,7 @@ def stage_evidence(results_dir: Path, evidence_dir: Path, selection: dict) -> di
 
 
 def build_status(selection: dict, artifact_url: str = "") -> list[dict]:
-    """Return the review status. The trusted publisher replaces its marker."""
+    """Return the review status with a link to the native Actions artifact."""
     screenshots = selection["screenshots"]
     diffs = selection["diffs"]
     if not screenshots and not diffs:
@@ -122,7 +120,7 @@ def build_status(selection: dict, artifact_url: str = "") -> list[dict]:
         "kind": "info",
         "title": "Desktop E2E visual evidence",
         "summary": "; ".join(summary_parts) + ".",
-        "detail": "\n".join((EVIDENCE_START, "<sub>inline evidence is publishing...</sub>", EVIDENCE_END)),
+        "detail": "Screenshots and visual diffs are available in the test artifacts (retained for 14 days).",
     }
     if artifact_url:
         result["link"] = artifact_url
