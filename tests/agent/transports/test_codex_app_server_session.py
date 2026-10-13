@@ -757,10 +757,9 @@ class TestSessionRetirement:
 
 
 
-    def test_final_agent_message_without_turn_completed_is_recovered(self):
-        """A completed assistant item is still a usable terminal response when
-        codex omits turn/completed and then goes quiet.
-        """
+    @pytest.mark.parametrize("trailing_tool", [False, True])
+    def test_agent_message_without_turn_completed_times_out(self, trailing_tool):
+        """Progress text cannot turn an expired protocol turn into success."""
         client = FakeClient()
         client.queue_notification(
             "item/completed",
@@ -768,6 +767,13 @@ class TestSessionRetirement:
             threadId="t",
             turnId="tu1",
         )
+        if trailing_tool:
+            client.queue_notification(
+                "item/started",
+                item={"type": "commandExecution", "id": "tool-1"},
+                threadId="t",
+                turnId="tu1",
+            )
         s = make_session(client)
         r = s.run_turn(
             "hi",
@@ -775,14 +781,14 @@ class TestSessionRetirement:
             notification_poll_timeout=0.01,
         )
         assert r.final_text == "done"
-        assert r.interrupted is False
-        assert r.error is None
-        assert r.should_retire is False
+        assert r.interrupted is True
+        assert "turn timed out" in r.error
+        assert r.should_retire is True
         assert any(
             msg["role"] == "assistant" and msg.get("content") == "done"
             for msg in r.projected_messages
         )
-        assert not any(method == "turn/interrupt" for method, _ in client.requests)
+        assert any(method == "turn/interrupt" for method, _ in client.requests)
 
 
     def test_post_tool_watchdog_uses_monotonic_clock(self):
