@@ -311,13 +311,20 @@ class CodexAppServerSession:
         # to surface a real summary in the approval prompt (quirk #4).
         self._pending_file_changes: dict[str, str] = {}
         self._closed = False
+        self._lifecycle_lock = threading.RLock()
 
     # ---------- lifecycle ----------
 
     def ensure_started(self) -> str:
+        with self._lifecycle_lock:
+            return self._ensure_started()
+
+    def _ensure_started(self) -> str:
         """Spawn the subprocess, do the initialize handshake, and start a
         thread. Returns the codex thread id. Idempotent — repeated calls
         return the same thread id."""
+        if self._closed:
+            raise RuntimeError("Codex app-server session is closed")
         if self._thread_id is not None:
             return self._thread_id
         if self._client is None:
@@ -393,18 +400,19 @@ class CodexAppServerSession:
         return self._thread_id
 
     def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        with self._active_turn_lock:
-            self._active_turn_id = None
-        if self._client is not None:
-            try:
+        # Let the turn owner unwind before closing its transport. Gateway
+        # cancellation does not stop the executor thread running that turn.
+        self.request_interrupt()
+        with self._lifecycle_lock:
+            if self._closed:
+                return
+            self._closed = True
+            with self._active_turn_lock:
+                self._active_turn_id = None
+            if self._client is not None:
                 self._client.close()
-            except Exception:  # pragma: no cover - best-effort cleanup
-                pass
-            self._client = None
-        self._thread_id = None
+                self._client = None
+            self._thread_id = None
 
     def __enter__(self) -> "CodexAppServerSession":
         return self
@@ -487,6 +495,22 @@ class CodexAppServerSession:
     # ---------- per-turn ----------
 
     def run_turn(
+        self,
+        user_input: Any,
+        *,
+        turn_timeout: float = 600.0,
+        notification_poll_timeout: float = 0.25,
+        post_tool_quiet_timeout: float = 90.0,
+    ) -> TurnResult:
+        with self._lifecycle_lock:
+            return self._run_turn(
+                user_input,
+                turn_timeout=turn_timeout,
+                notification_poll_timeout=notification_poll_timeout,
+                post_tool_quiet_timeout=post_tool_quiet_timeout,
+            )
+
+    def _run_turn(
         self,
         user_input: Any,
         *,
